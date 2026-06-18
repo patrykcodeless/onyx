@@ -19,6 +19,8 @@ from onyx.db.enums import ApprovalDecision
 from onyx.db.enums import EndpointPolicy
 from onyx.db.models import ActionApproval
 from onyx.db.models import BuildSession
+from onyx.db.models import User
+from onyx.sandbox_proxy import approval_cache
 from onyx.server.features.build.db.action_approval import get_action_approval
 from onyx.server.features.build.db.action_approval import get_action_approval_for_user
 from onyx.server.features.build.db.action_approval import insert_action_approval
@@ -26,10 +28,17 @@ from onyx.server.features.build.db.action_approval import (
     list_session_pending_action_approvals,
 )
 from onyx.server.features.build.db.action_approval import try_record_decision
-from tests.external_dependency_unit.craft._test_helpers import _set_created_at
-from tests.external_dependency_unit.craft._test_helpers import action_entry
-from tests.external_dependency_unit.craft._test_helpers import default_action_entries
-from tests.external_dependency_unit.craft._test_helpers import make_user
+from tests.common.craft.payloads import action_entry
+from tests.common.craft.payloads import default_action_entries
+from tests.external_dependency_unit.craft.db_helpers import make_user
+from tests.external_dependency_unit.craft.db_helpers import set_session_created_at
+
+# Hardcoded spec; the completeness check below pins the source constant to it.
+_WAIT_TIMEOUT_S_SPEC = 180
+
+
+def test_wait_timeout_spec() -> None:
+    assert approval_cache.WAIT_TIMEOUT_S == _WAIT_TIMEOUT_S_SPEC
 
 
 def _seed_pending(
@@ -97,15 +106,14 @@ def test_insert_action_approval_rejects_empty_actions(
         )
 
 
-def test_try_record_decision_happy_path_refreshes_in_memory_row(
+def test_try_record_decision_happy_path_returns_decided_row(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
     build_session_with_user: Callable[..., BuildSession],
 ) -> None:
-    """Pins the ``db_session.refresh(row)`` fix.
-
-    Without it the identity-mapped ORM object still reads ``decision=None``
-    even after Postgres has the new value.
+    """Happy-path smoke: the conditional UPDATE returns the row carrying the
+    new decision. (The identity-map refresh is pinned end-to-end by
+    ``test_approvals_api.py::test_submit_decision_happy_path_returns_refreshed_row``.)
     """
     user = make_user(db_session)
     bs = build_session_with_user(user=user)
@@ -123,9 +131,6 @@ def test_try_record_decision_happy_path_refreshes_in_memory_row(
     assert returned.approval_id == row.approval_id
     assert returned.decision == ApprovalDecision.REJECTED
     assert returned.decided_at is not None
-    # The same ORM object reference must reflect the new state (refresh fix).
-    assert row.decision == ApprovalDecision.REJECTED
-    assert row.decided_at is not None
 
 
 def test_try_record_decision_lost_race_returns_none_and_preserves_decision(
@@ -215,7 +220,9 @@ def test_list_session_pending_action_approvals_filters_by_created_after(
     new_row = _seed_pending(db_session, bs.id, payload={"cmd": "new"})
 
     one_hour_ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
-    _set_created_at(db_session, ActionApproval, old_row.approval_id, one_hour_ago)
+    set_session_created_at(
+        db_session, ActionApproval, old_row.approval_id, one_hour_ago
+    )
 
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
     rows = list_session_pending_action_approvals(
@@ -224,3 +231,90 @@ def test_list_session_pending_action_approvals_filters_by_created_after(
     returned_ids = {r.approval_id for r in rows}
     assert new_row.approval_id in returned_ids
     assert old_row.approval_id not in returned_ids
+
+
+def test_list_pending_excludes_aged_rows_at_wait_timeout_boundary(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    build_session_with_user: Callable[..., BuildSession],
+) -> None:
+    """Pending rows older than ``WAIT_TIMEOUT_S`` are excluded by the
+    ``created_after`` cutoff (the proxy's wait window).
+
+    Two boundary rows straddling the cutoff by 5s pin the inclusive ``>=``
+    bound: an off-by-one (``>`` instead of ``>=``) would drop the just-live row.
+    """
+    user = make_user(db_session)
+    bs = build_session_with_user(user=user)
+
+    fresh = _seed_pending(db_session, bs.id, payload={"cmd": "fresh"})
+    just_live = _seed_pending(db_session, bs.id, payload={"boundary": "just_live"})
+    just_expired = _seed_pending(
+        db_session, bs.id, payload={"boundary": "just_expired"}
+    )
+
+    now = dt.datetime.now(dt.timezone.utc)
+    # Cutoff edge: created exactly at WAIT_TIMEOUT_S ago is still live (>=).
+    set_session_created_at(
+        db_session,
+        ActionApproval,
+        just_live.approval_id,
+        now - dt.timedelta(seconds=_WAIT_TIMEOUT_S_SPEC - 5),
+    )
+    set_session_created_at(
+        db_session,
+        ActionApproval,
+        just_expired.approval_id,
+        now - dt.timedelta(seconds=_WAIT_TIMEOUT_S_SPEC + 5),
+    )
+
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=_WAIT_TIMEOUT_S_SPEC
+    )
+    rows = list_session_pending_action_approvals(
+        db_session, bs.id, created_after=cutoff
+    )
+    returned_ids = {r.approval_id for r in rows}
+
+    assert fresh.approval_id in returned_ids
+    assert just_live.approval_id in returned_ids
+    assert just_expired.approval_id not in returned_ids
+
+
+def test_claim_path_sees_missing_row_after_session_cascade(
+    db_session: Session,
+    tenant_context: None,  # noqa: ARG001
+    build_session_with_user: Callable[..., BuildSession],
+) -> None:
+    """Row-missing branch of the proxy's expired-claim path.
+
+    Deleting the parent ``BuildSession`` cascades the pending approval row away
+    (``ondelete=CASCADE`` on ``session_id``). The claim helpers then see
+    nothing: ``try_record_decision`` has no ``decision IS NULL`` row to UPDATE
+    so it returns ``None``, and ``get_action_approval`` returns ``None`` — the
+    exact state ``_claim_expired_or_read_winner`` maps to ``EXPIRED``.
+    """
+    user = make_user(db_session)
+    bs = build_session_with_user(user=user)
+    row = _seed_pending(db_session, bs.id)
+    approval_id = row.approval_id
+
+    db_session.query(BuildSession).filter(BuildSession.id == bs.id).delete(
+        synchronize_session=False
+    )
+    db_session.commit()
+    db_session.expire_all()
+
+    # Nothing to UPDATE → no winner claimed.
+    assert (
+        try_record_decision(
+            db_session,
+            approval_id=approval_id,
+            decision=ApprovalDecision.EXPIRED,
+        )
+        is None
+    )
+    # And no surviving row to read a prior decision from.
+    assert get_action_approval(db_session, approval_id) is None
+    # The cascade only crossed build_session → action_approval; the user remains.
+    assert db_session.get(User, user.id) is not None

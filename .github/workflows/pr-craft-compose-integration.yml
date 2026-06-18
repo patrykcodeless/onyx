@@ -83,6 +83,7 @@ jobs:
               - 'deployment/docker_compose/docker-compose.yml'
               - 'deployment/docker_compose/docker-compose.dev.yml'
               - 'deployment/docker_compose/docker-compose.craft.yml'
+              - 'backend/tests/integration/tests/craft/*.py'
               - 'backend/tests/integration/tests/craft/docker_e2e/**'
               - '.github/workflows/pr-craft-compose-integration.yml'
               - '.github/actions/setup-python-and-install-dependencies/**'
@@ -222,6 +223,9 @@ jobs:
           # line-buffered flush so the file is up to date when that happens.
           set -o pipefail
           mkdir -p ../compose-logs
+          # Runs the docker-backed e2e suite plus the craft root API-boundary
+          # tests (session/message/file-ops/upload/user-library/proxy/scheduled
+          # HTTP contracts). The k8s subdir has its own dedicated lane.
           PYTHONUNBUFFERED=1 stdbuf -oL -eL py.test \
             -v \
             -s \
@@ -229,7 +233,8 @@ jobs:
             -o faulthandler_timeout=90 \
             --tb=short \
             --durations=10 \
-            tests/integration/tests/craft/docker_e2e \
+            tests/integration/tests/craft \
+            --ignore=tests/integration/tests/craft/k8s \
             2>&1 | tee ../compose-logs/pytest.log
 
       # Inline tail for fast triage in the GH Actions UI without downloading

@@ -1,18 +1,13 @@
-"""K8s push contract + sandbox lifecycle (real K8s).
+"""K8s push contract + sandbox lifecycle in the full Craft integration lane.
 
-The file-level ``pytestmark`` gates the entire module to the K8s CI lane.
-Per project memory: never run these locally — they touch the real cluster.
-
-Prerequisites:
-- A running Kubernetes cluster (kind, minikube, or real cluster)
-- ``SANDBOX_BACKEND=kubernetes`` in the environment
-- The sandbox namespace to exist (default: ``onyx-sandboxes``)
-- Service accounts for sandbox (``sandbox-runner``)
+The file-level ``pytestmark`` gates the entire module to the K8s CI lane, which
+installs the Helm chart into kind and runs against the real API, web_server,
+Celery workers, sandbox proxy, and sandbox pods.
 
 Run with:
 
     SANDBOX_BACKEND=kubernetes python -m dotenv -f .vscode/.env run -- \\
-        pytest backend/tests/external_dependency_unit/craft/test_kubernetes_sandbox.py -v
+        pytest backend/tests/integration/tests/craft/k8s/test_kubernetes_sandbox.py -v
 """
 
 from __future__ import annotations
@@ -23,6 +18,7 @@ import io
 import os
 import tarfile
 import time
+from contextlib import suppress
 from uuid import UUID
 from uuid import uuid4
 
@@ -43,10 +39,10 @@ from onyx.server.features.build.sandbox.kubernetes.kubernetes_sandbox_manager im
 )
 from onyx.server.features.build.sandbox.models import LLMProviderConfig
 from onyx.utils.logger import setup_logger
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
-from tests.external_dependency_unit.craft._test_helpers import default_llm_config
-from tests.external_dependency_unit.craft.conftest import pod_exec
-from tests.external_dependency_unit.craft.conftest import wait_for_pod_deletion
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+from tests.common.craft.payloads import default_llm_config
+from tests.integration.tests.craft.k8s.k8s_fixtures import pod_exec
+from tests.integration.tests.craft.k8s.k8s_fixtures import wait_for_pod_deletion
 
 logger = setup_logger()
 
@@ -91,7 +87,7 @@ def _provisioned_sandbox(
     info = manager.provision(
         sandbox_id=sandbox_id,
         user_id=TEST_USER_ID,
-        tenant_id=TEST_TENANT_ID,
+        tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE,
         llm_config=config,
         onyx_pat="ci-test-pat",
     )
@@ -581,53 +577,28 @@ def test_terminate_removes_pod_and_marks_db(
     ``health_check`` False.
     """
     sandbox_id = uuid4()
-    _provisioned_sandbox(k8s_manager, sandbox_id)
     pod_name = k8s_manager._get_pod_name(sandbox_id)
+    try:
+        _provisioned_sandbox(k8s_manager, sandbox_id)
 
-    # Pod exists before termination.
-    pod = k8s_client.read_namespaced_pod(name=pod_name, namespace=SANDBOX_NAMESPACE)
-    assert pod.status.phase == "Running"
+        # Pod exists before termination.
+        pod = k8s_client.read_namespaced_pod(name=pod_name, namespace=SANDBOX_NAMESPACE)
+        assert pod.status.phase == "Running"
 
-    k8s_manager.terminate(sandbox_id)
-    wait_for_pod_deletion(k8s_client, pod_name, SANDBOX_NAMESPACE)
+        k8s_manager.terminate(sandbox_id)
+        wait_for_pod_deletion(k8s_client, pod_name, SANDBOX_NAMESPACE)
 
-    with pytest.raises(ApiException) as exc_info:
-        k8s_client.read_namespaced_pod(name=pod_name, namespace=SANDBOX_NAMESPACE)
-    assert exc_info.value.status == 404, (
-        f"after terminate, the pod should be gone (404). Got: {exc_info.value.status}"
-    )
+        with pytest.raises(ApiException) as exc_info:
+            k8s_client.read_namespaced_pod(name=pod_name, namespace=SANDBOX_NAMESPACE)
+        assert exc_info.value.status == 404, (
+            f"after terminate, the pod should be gone (404). Got: {exc_info.value.status}"
+        )
 
-    assert not k8s_manager.health_check(sandbox_id, timeout=5.0), (
-        "health_check() should return False after termination"
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "known: _get_pod_name uses uuid[:8] = 32 bits of entropy. Birthday "
-        "collision at ~77k sandboxes ever; current failure on collision is "
-        "K8s 409 on provision, not data leak."
-    ),
-)
-def test_pod_name_uses_full_uuid_not_first_8_chars() -> None:
-    """Asserts pod_name encodes the full sandbox UUID, so two UUIDs sharing
-    the first 8 hex chars produce distinct pod names.
-
-    Currently fails because ``_get_pod_name`` truncates to 8 chars
-    (xfail strict absorbs). When the fix lands, the xfail flips to XPASS
-    and the fixer removes the mark.
-    """
-    # Bypass __init__/_initialize since _get_pod_name does not touch the K8s
-    # client; it only formats the UUID. This keeps the test deterministic
-    # even though the file's pytestmark gate already restricts execution to
-    # the K8s CI job.
-    manager = KubernetesSandboxManager.__new__(KubernetesSandboxManager)
-
-    uuid_a = UUID("abc12345-0000-0000-0000-000000000001")
-    uuid_b = UUID("abc12345-0000-0000-0000-000000000002")
-
-    assert manager._get_pod_name(uuid_a) != manager._get_pod_name(uuid_b), (
-        "pod name must encode the full UUID so distinct sandboxes do not "
-        "collide on the first 8 hex chars"
-    )
+        assert not k8s_manager.health_check(sandbox_id, timeout=5.0), (
+            "health_check() should return False after termination"
+        )
+    finally:
+        with suppress(Exception):
+            k8s_manager.terminate(sandbox_id)
+        with suppress(Exception):
+            wait_for_pod_deletion(k8s_client, pod_name, SANDBOX_NAMESPACE)

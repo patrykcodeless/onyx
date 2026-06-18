@@ -1,18 +1,13 @@
-"""Scheduled tasks (executor half, ext-dep).
+"""Scheduled task dispatcher and cleanup tests (external-dependency unit).
 
-Drives the real ``run_scheduled_task_logic`` end-to-end against Postgres
-and the real ``LocalSandboxManager``. Scope of this file:
+Drives the real Celery task bodies directly against Postgres and Redis. Scope:
 
 * Dispatcher concurrency (``SELECT ... FOR UPDATE SKIP LOCKED``).
 * Stuck-run cleanup sweeper.
-* The executor's wake-failure contract — when
-  ``SessionManager.ensure_sandbox_running`` raises, the run is marked
-  ``FAILED`` with ``error_class=sandbox_wake_failed``.
 
-State-machine coverage for ``ensure_sandbox_running`` itself
-(SLEEPING / TERMINATED / FAILED → wake, PROVISIONING → wait, etc.) lives
-in ``test_ensure_sandbox_running.py`` and is not duplicated here — the
-executor merely delegates to that API.
+The deployed Craft integration lane exercises API/Celery behavior through the
+real API server. These tests stay here because they intentionally invoke task
+functions directly to pin internal database concurrency contracts.
 """
 
 from __future__ import annotations
@@ -33,21 +28,15 @@ from onyx.background.celery.tasks.scheduled_tasks.tasks import (
 from onyx.background.celery.tasks.scheduled_tasks.tasks import (
     dispatch_due_scheduled_tasks,
 )
-from onyx.db.enums import SandboxStatus
-from onyx.db.enums import ScheduledTaskErrorClass
 from onyx.db.enums import ScheduledTaskRunStatus
 from onyx.db.enums import ScheduledTaskStatus
 from onyx.db.enums import ScheduledTaskTriggerSource
 from onyx.db.models import ScheduledTask
 from onyx.db.models import ScheduledTaskRun
 from onyx.db.models import User
-from onyx.server.features.build.configs import SANDBOX_BACKEND
-from onyx.server.features.build.configs import SandboxBackend
-from onyx.server.features.build.scheduled_tasks.executor import run_scheduled_task_logic
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
-from tests.external_dependency_unit.craft._test_helpers import make_sandbox
-from tests.external_dependency_unit.craft._test_helpers import make_user
+from tests.external_dependency_unit.craft.db_helpers import make_user
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -94,49 +83,6 @@ def _seed_task_and_queued_run(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    SANDBOX_BACKEND != SandboxBackend.KUBERNETES,
-    reason="Exercises run_scheduled_task_logic → SessionManager → real "
-    "KubernetesSandboxManager init; requires SANDBOX_BACKEND=kubernetes "
-    "(runs in the dedicated K8s CI job).",
-)
-def test_run_fails_when_wake_fails(
-    db_session: Session,
-    test_user: User,  # noqa: ARG001
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``ensure_sandbox_running`` raising → run FAILED / ``sandbox_wake_failed``.
-
-    Trigger a deterministic wake failure by seeding the sandbox as
-    ``PROVISIONING`` and dropping the executor's wait window to 0s so
-    ``_wait_for_provisioning_to_complete`` raises ``SandboxProvisioningError``
-    on the first deadline check. That's the executor's Phase-1
-    try/except path, which must translate any exception escaping
-    ``ensure_sandbox_running`` into ``FAILED`` with
-    ``error_class=sandbox_wake_failed``.
-
-    "How we got there" (which specific state triggered the wake, which
-    inner call raised) is intentionally out of scope — this test pins
-    only the executor's contract.
-    """
-    monkeypatch.setattr(
-        "onyx.server.features.build.scheduled_tasks.executor.PROVISIONING_WAIT_SECONDS",
-        0,
-    )
-
-    user = make_user(db_session)
-    make_sandbox(db_session, user, status=SandboxStatus.PROVISIONING)
-    _, run = _seed_task_and_queued_run(db_session, user)
-
-    run_scheduled_task_logic(run.id)
-
-    db_session.expire_all()
-    refreshed = db_session.get(ScheduledTaskRun, run.id)
-    assert refreshed is not None
-    assert refreshed.status == ScheduledTaskRunStatus.FAILED
-    assert refreshed.error_class == ScheduledTaskErrorClass.SANDBOX_WAKE_FAILED.value
 
 
 def test_dispatch_uses_skip_locked_to_avoid_dupes(
@@ -193,10 +139,12 @@ def test_dispatch_uses_skip_locked_to_avoid_dupes(
     fake_app = _FakeApp()
 
     def _dispatch_in_thread(idx: int) -> None:
-        token = CURRENT_TENANT_ID_CONTEXTVAR.set(TEST_TENANT_ID)
+        token = CURRENT_TENANT_ID_CONTEXTVAR.set(POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE)
         try:
             barrier.wait(timeout=5)
-            results[idx] = dispatch_due_scheduled_tasks.run(tenant_id=TEST_TENANT_ID)
+            results[idx] = dispatch_due_scheduled_tasks.run(
+                tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+            )
         finally:
             CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
 
@@ -272,7 +220,9 @@ def test_cleanup_stuck_runs_marks_queued_over_threshold_failed(
     db_session.add(run)
     db_session.commit()
 
-    marked = cleanup_stuck_scheduled_runs.run(tenant_id=TEST_TENANT_ID)
+    marked = cleanup_stuck_scheduled_runs.run(
+        tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert marked >= 1
 
     db_session.expire_all()
@@ -317,7 +267,9 @@ def test_cleanup_stuck_runs_marks_running_over_threshold_failed(
     db_session.add(run)
     db_session.commit()
 
-    marked = cleanup_stuck_scheduled_runs.run(tenant_id=TEST_TENANT_ID)
+    marked = cleanup_stuck_scheduled_runs.run(
+        tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert marked >= 1
 
     db_session.expire_all()

@@ -501,6 +501,9 @@ api:
   tolerations: []
   affinity: {}
 
+  # Run database migrations before starting the API server. Disable this only
+  # when migrations are run by a separate, coordinated deployment step.
+  runStartupMigrations: true
   # Run update-ca-certificates before starting the server.
   # DEPRECATED: prefer the top-level customCACerts block, which covers all
   # outbound-TLS pods. This flag only affects the API server; useful when

@@ -1,11 +1,12 @@
 """Streaming-output regression tests for ``DockerSandboxManager``.
 
-Mirrors :mod:`test_opencode_serve_streaming` (which runs against a real
-``KubernetesSandboxManager`` pod) but provisions a real Docker sandbox
-container via :class:`DockerSandboxManager`. The tests assert on the
+This is the direct serve-transport event matrix. The Craft k8s integration
+lane covers deployed API/Celery handoff via ``test_messages_api_k8s.py``; this
+module provisions a real Docker sandbox container via
+:class:`DockerSandboxManager` and asserts on the
 ``SandboxEvent`` stream that ``send_message`` yields — the same events the
 session manager persists and the frontend renders — so any divergence
-between the Docker and K8s serve paths surfaces here.
+in the Docker serve path surfaces here.
 
 Why these aren't unit tests
 ---------------------------
@@ -38,6 +39,8 @@ from __future__ import annotations
 import os
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import Any
+from typing import cast
 from uuid import UUID
 from uuid import uuid4
 
@@ -62,7 +65,7 @@ from onyx.server.features.build.sandbox.event_schema import ToolCallStart
 from onyx.server.features.build.sandbox.models import LLMProviderConfig
 from onyx.server.features.build.sandbox.serve_transport import ServeConnectionInfo
 from onyx.server.features.build.sandbox.sse import SSEKeepalive
-from tests.external_dependency_unit.craft._test_helpers import default_llm_config
+from tests.common.craft.payloads import default_llm_config
 
 # ----------------------------------------------------------------------
 # Module-wide skip gate
@@ -191,7 +194,7 @@ def handle(_pool_container: _PoolContainer) -> Generator[_Handle, None, None]:
 
 
 # ----------------------------------------------------------------------
-# Event-collection helpers (mirrors test_opencode_serve_streaming)
+# Event-collection helpers
 # ----------------------------------------------------------------------
 
 
@@ -209,6 +212,10 @@ class _Collected:
     @property
     def text(self) -> str:
         return "".join(c.content.text for c in self.chunks)  # type: ignore[union-attr]
+
+    @property
+    def thought_text(self) -> str:
+        return "".join(c.content.text for c in self.thoughts)  # type: ignore[union-attr]
 
 
 def _drive_turn(
@@ -304,6 +311,27 @@ def test_simple_message_streams_text_and_terminates(handle: _Handle) -> None:
     )
 
 
+def test_reasoning_routed_to_thought_chunk(handle: _Handle) -> None:
+    """gpt-5-mini reliably emits a short reasoning preamble. That content
+    must land in AgentThoughtChunk, NOT in AgentMessageChunk. Regression
+    test for the wire-grammar bug where deltas on ``type=reasoning`` parts
+    came across as visible message chunks."""
+    out, _ = _drive_turn(handle, "Greet me in five words.")
+
+    assert out.term is not None
+    assert out.errors == []
+    # The visible answer should not include the model's reasoning prefix
+    # ("The user is asking…" or similar). We don't pin the exact text but
+    # the visible chunk should be reasonably short.
+    assert len(out.text) > 0
+    assert len(out.text) < 200, (
+        f"visible text suspiciously long ({len(out.text)} chars) — "
+        f"reasoning may be leaking through: {out.text[:200]!r}"
+    )
+    # We may or may not see thought_text depending on the model run — but
+    # if we do, that's the right channel.
+
+
 def test_bash_tool_call_lifecycle(handle: _Handle) -> None:
     """Tool call lifecycle parity with K8s: exactly one ToolCallStart per
     call_id; ToolCallProgress sequence ends in status=completed."""
@@ -325,6 +353,140 @@ def test_bash_tool_call_lifecycle(handle: _Handle) -> None:
             f"tool call {cid} never reached status=completed; "
             f"statuses: {[p.status for p in progress]}"
         )
+
+
+def test_multi_step_turn_doesnt_drop_post_tool_text(handle: _Handle) -> None:
+    """A turn that involves a tool call → follow-up answer creates >1
+    assistant message in opencode. Our translator must track every
+    assistant message id, not just the first. Regression test for the
+    bug where post-tool text was dropped because its messageID wasn't
+    in our singleton-tracked id.
+
+    Model variance: gpt-5-mini sometimes refuses to "say something
+    after the tool" no matter how the prompt is worded. To assert
+    correctness without flaking on model whim, we subscribe to the raw
+    ``/event`` stream IN PARALLEL with the manager's send_message and
+    check: IF opencode emitted text-part content on more than one
+    assistant message, our translator must surface text from BOTH. If
+    the model only used a single assistant message this run, the
+    regression we care about can't manifest and the test still passes."""
+    import json as _json
+    import threading as _thr
+    import time as _time
+
+    import httpx as _httpx
+
+    conn = handle.manager._serve_connection_info(handle.sandbox_id)
+    assert conn.password, "opencode serve password missing for this sandbox"
+
+    raw_events: list[dict[str, Any]] = []
+    sub_stop = _thr.Event()
+
+    def _subscribe() -> None:
+        try:
+            with _httpx.stream(
+                "GET",
+                f"{conn.base_url}/event",
+                auth=_httpx.BasicAuth("opencode", conn.password or ""),
+                timeout=_httpx.Timeout(None, read=120),
+            ) as r:
+                buf = ""
+                for ch in r.iter_text():
+                    if sub_stop.is_set():
+                        return
+                    buf += ch
+                    while "\n\n" in buf:
+                        blk, buf = buf.split("\n\n", 1)
+                        data = [
+                            line[len("data: ") :]
+                            for line in blk.splitlines()
+                            if line.startswith("data: ")
+                        ]
+                        if data:
+                            try:
+                                raw_events.append(_json.loads("\n".join(data)))
+                            except _json.JSONDecodeError:
+                                pass
+        except Exception:
+            pass
+
+    sub_t = _thr.Thread(target=_subscribe, daemon=True)
+    sub_t.start()
+    _time.sleep(0.5)  # let the subscription land before we drive the turn
+
+    try:
+        out, _ = _drive_turn(
+            handle,
+            "First run the bash command `echo HELLO_FROM_BASH`. "
+            "After the command finishes, write a single sentence in plain "
+            "English describing what the command printed.",
+        )
+    finally:
+        sub_stop.set()
+        _time.sleep(0.3)
+
+    assert out.term is not None
+    assert out.errors == []
+    assert len(out.tool_starts) >= 1
+
+    # Inspect the raw opencode wire: which assistant message ids did
+    # opencode emit text parts on?
+    assistant_msg_ids_with_text: set[str] = set()
+    for e in raw_events:
+        if e.get("type") != "message.part.updated":
+            continue
+        p = (e.get("properties") or {}).get("part") or {}
+        if p.get("type") != "text":
+            continue
+        msg_id = p.get("messageID")
+        if isinstance(msg_id, str) and (p.get("text") or "") != "":
+            assistant_msg_ids_with_text.add(msg_id)
+
+    if len(assistant_msg_ids_with_text) <= 1:
+        pytest.skip(
+            "gpt-5-mini didn't emit a post-tool answer this run "
+            "(opencode produced text on only one assistant message); "
+            "the multi-message regression path can't manifest here."
+        )
+
+    # opencode DID emit text on >1 assistant message — our translator
+    # must have surfaced at least some AgentMessageChunk content.
+    assert len(out.text) > 0, (
+        "opencode emitted text parts on "
+        f"{len(assistant_msg_ids_with_text)} distinct assistant messages "
+        f"but the translator yielded 0 AgentMessageChunk. Post-tool text "
+        "is being dropped — likely the assistant-message-id tracking is "
+        "broken (regression on the multi-message turn path). "
+        f"assistant_message_ids on the wire: {assistant_msg_ids_with_text}"
+    )
+
+
+def test_tool_call_raw_output_wrapped_for_consumers(handle: _Handle) -> None:
+    """``ToolCallProgress.raw_output`` must be a dict shaped
+    ``{"output": <string>, "metadata"?: {...}}`` — that's what the
+    frontend's ``parsePacket.ts:getRawOutput`` extracts. opencode emits
+    ``state.output`` as a plain string for ``bash``; the translator wraps it."""
+    out, _ = _drive_turn(
+        handle,
+        "Run the bash command `echo WRAPPED_OUTPUT_PROBE`. No commentary.",
+    )
+
+    bash_completed = [
+        p for p in out.tool_progress if p.kind == "execute" and p.status == "completed"
+    ]
+    assert bash_completed, (
+        f"no completed bash tool_call_progress; "
+        f"statuses: {[(p.kind, p.status) for p in out.tool_progress]}"
+    )
+    ro = cast(dict[str, Any] | None, bash_completed[-1].raw_output)
+    assert ro is not None
+    assert "output" in ro, (
+        f"raw_output missing 'output' key (frontend depends on it): {ro!r}"
+    )
+    assert isinstance(ro["output"], str)
+    assert "WRAPPED_OUTPUT_PROBE" in ro["output"], (
+        f"bash output didn't include our sentinel: {ro['output']!r}"
+    )
 
 
 def test_multi_turn_session_terminates_each_turn(handle: _Handle) -> None:

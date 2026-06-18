@@ -298,6 +298,58 @@ def test_list_directory_filters_hidden_entries(admin_user: DATestUser) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Upload stats (file count + byte total under the attachments dir)
+# ---------------------------------------------------------------------------
+
+
+def test_upload_stats_empty_session_has_no_attachments(
+    admin_user: DATestUser,
+) -> None:
+    """A fresh session reports no attachments.
+
+    Restores the ``get_upload_stats`` empty-case coverage (formerly the
+    ext-dep ``test_get_upload_stats_empty`` against the K8s pod). There is
+    no HTTP endpoint surfacing the raw ``(file_count, total_size)`` tuple —
+    ``get_upload_stats`` is only an internal upload gatekeeper — so we pin
+    its observable surface: an empty session lists zero files under the
+    ``attachments`` directory, which is exactly what the stat's
+    ``find -type f`` walks.
+    """
+    session_id = _create_session_id(admin_user)
+
+    listing = BuildSessionManager.list_files(admin_user, session_id, path="attachments")
+    files = [e for e in listing.get("entries", []) if not e["is_directory"]]
+    assert files == []
+
+
+def test_upload_stats_reflect_uploaded_files(admin_user: DATestUser) -> None:
+    """After N uploads the attachments dir lists N files at their byte sizes.
+
+    Restores the ``get_upload_stats`` with-files coverage (formerly the
+    ext-dep ``test_get_upload_stats_with_files``). Uploading two files of
+    distinct known sizes and reading them back through the listing
+    exercises the same on-disk attachments tree that the stat counts +
+    sums, end-to-end through the real sandbox manager.
+    """
+    session_id = _create_session_id(admin_user)
+
+    first = b"hello"  # 5 bytes
+    second = b"world!"  # 6 bytes
+    BuildSessionManager.upload_file(
+        admin_user, session_id, filename="file1.txt", content=first
+    )
+    BuildSessionManager.upload_file(
+        admin_user, session_id, filename="file2.txt", content=second
+    )
+
+    listing = BuildSessionManager.list_files(admin_user, session_id, path="attachments")
+    files = [e for e in listing.get("entries", []) if not e["is_directory"]]
+    sizes_by_name = {e["name"]: e["size"] for e in files}
+
+    assert sizes_by_name == {"file1.txt": len(first), "file2.txt": len(second)}
+
+
+# ---------------------------------------------------------------------------
 # Cross-user isolation
 # ---------------------------------------------------------------------------
 

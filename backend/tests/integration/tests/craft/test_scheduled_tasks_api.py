@@ -3,11 +3,11 @@
 Integration tests for the user-facing scheduled-tasks HTTP API in
 ``onyx.server.features.build.scheduled_tasks.api``.
 
-Hits the real backend over HTTP. The executor / dispatch state-machine
-half is covered in
-``tests/external_dependency_unit/craft/test_scheduled_task_executor.py``
-— this file deliberately stays at the HTTP boundary and never invokes
-the executor directly.
+Hits the real backend over HTTP. Internal dispatcher and cleanup contracts are
+covered in
+``tests/external_dependency_unit/craft/test_scheduled_task_executor.py``; this
+file deliberately stays at the HTTP boundary and never invokes the executor
+directly.
 """
 
 from __future__ import annotations
@@ -328,10 +328,9 @@ def test_list_runs_paginates_by_started_at_cursor(admin_user: DATestUser) -> Non
 #
 # The original test inserted ``BuildSession`` + ``BuildMessage`` rows
 # directly via ``get_session_with_current_tenant`` — an integration-shaped
-# ext-dep assertion that bypasses the API. Moving it to ext-dep keeps the
+# external-dependency assertion that bypasses the API. Moving it there keeps the
 # DB-row-visibility check at the right layer; ``GET /api/build/sessions``
 # HTTP-shape is covered by the sidebar listing tests elsewhere.
 #
-# Driving this through the API in integration would require a running
-# celery worker to execute the scheduled-task fire and insert the
-# ``origin=SCHEDULED`` row — not currently guaranteed in integration CI.
+# The full k8s Craft lane covers deployed API/Celery behavior. This root API
+# file keeps the narrower HTTP-shape assertions.

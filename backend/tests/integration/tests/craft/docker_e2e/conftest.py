@@ -21,10 +21,8 @@ The Slack seeding is needed because the default deployment has no external apps
 configured. ``ExternalAppActionMatcher`` only claims a request if some app's
 ``upstream_url_patterns`` matches the URL; without a Slack row,
 ``chat.postMessage`` is treated as off-catalog and not gated.
-``AUTO_PROVISION_DEFAULT_EXTERNAL_APPS`` defaults to off and the K8s lane
-doesn't actually run ``test_approval_gate.py`` either (it's not listed in the
-lane's paths filter or pytest args), so this fixture is the first place to wire
-the seeding in CI.
+``AUTO_PROVISION_DEFAULT_EXTERNAL_APPS`` defaults to off, so this fixture seeds
+the docker-compose lane independently of the K8s lane's own Slack seed.
 
 This conftest is intentionally scoped to ``docker_e2e/`` only. Sibling craft
 tests under ``tests/integration/tests/craft/`` keep the in-process model.

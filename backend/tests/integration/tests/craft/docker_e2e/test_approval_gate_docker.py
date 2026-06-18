@@ -1,13 +1,12 @@
 """Docker-backend end-to-end approval-gate + posture tests.
 
-Mirrors the K8s ``test_approval_gate.py`` (which lives at
-``external_dependency_unit/craft/``) but runs as an **integration test**: the
-full compose stack with the craft overlay must be up before pytest starts, and
-assertions are made against the real api_server + sandbox-proxy + sandbox
-containers via HTTP and ``docker exec``. The tier-up from external-dep-unit is
-deliberate -- the docker-specific bug classes we catch here (image ENTRYPOINT
-concat, HOME after setpriv, curl httpoxy interactions on the bridge) only
-surface in the integrated provisioning flow.
+Mirrors the K8s integration ``test_approval_gate.py`` but runs against the
+docker-compose Craft stack: the full compose stack with the craft overlay must
+be up before pytest starts, and assertions are made against the real api_server
++ sandbox-proxy + sandbox containers via HTTP and ``docker exec``. The
+docker-specific bug classes we catch here (image ENTRYPOINT concat, HOME after
+setpriv, curl httpoxy interactions on the bridge) only surface in the
+integrated provisioning flow.
 
 Bring-up (handled by ``.github/workflows/pr-craft-compose-integration.yml``)::
 
@@ -481,9 +480,8 @@ def test_sessions_directory_writable_by_sandbox_user(
 # ``ExternalAppActionMatcher`` actually claims ``chat.postMessage``. Without
 # that seeding the matcher returns ``None``, the request leaves the proxy with
 # ``policy=off_catalog``, and no approval ever parks. The default deployment has
-# no external apps configured and the K8s lane's ``test_approval_gate.py`` isn't
-# actually run by its CI (verified -- not in the lane's ``paths:`` filter or
-# pytest args), so this fixture is the first place to wire the seeding in.
+# no external apps configured, so docker-compose seeds Slack independently from
+# the K8s lane.
 # ------------------------------------------------------------------------------
 
 

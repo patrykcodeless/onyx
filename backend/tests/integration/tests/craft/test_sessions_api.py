@@ -71,21 +71,22 @@ def test_create_session_returns_201_with_session_and_sandbox_shape(
     admin_user: DATestUser,
     llm_provider: DATestLLMProvider,  # noqa: ARG001 — ensures a default LLM exists
 ) -> None:
-    """POST returns a body matching ``DetailedSessionResponse``."""
-    body = _create_session(admin_user)
-    # The endpoint declares ``response_model=DetailedSessionResponse``; FastAPI
-    # validates the shape on the way out. We just pin the fields the FE relies
-    # on so we'll notice if any are silently dropped.
-    assert body["id"]
+    """POST creates a session owned by the caller with a loaded sandbox."""
+    # FastAPI validates the full ``DetailedSessionResponse`` shape on the way
+    # out, so we only pin the FE-load-bearing values the framework can't
+    # guarantee: ownership, a non-null sandbox, and that the workspace was
+    # actually loaded into it.
+    response = client.post(
+        f"{API_SERVER_URL}/build/sessions",
+        json={"headless": False},
+        headers=admin_user.headers,
+        cookies=admin_user.cookies,
+    )
+    assert response.status_code == 201
+    body = response.json()
     assert body["user_id"] == admin_user.id
-    assert "status" in body
-    assert "created_at" in body
-    assert "sandbox" in body and body["sandbox"] is not None
-    assert "id" in body["sandbox"]
-    assert "status" in body["sandbox"]
+    assert body["sandbox"] is not None
     assert body["session_loaded_in_sandbox"] is True
-    assert "sharing_scope" in body
-    assert body["artifacts"] == [] or isinstance(body["artifacts"], list)
 
 
 def test_get_session_404_for_other_users_session(

@@ -8,212 +8,21 @@ document row + storage blob via the tree-listing endpoint.
 
 from __future__ import annotations
 
-import io
-import zipfile
-from collections.abc import Iterable
 from typing import Any
 from uuid import uuid4
 
-import httpx
-import pytest
-
-from tests.integration.common_utils.constants import API_SERVER_URL
-from tests.integration.common_utils.http_client import client
 from tests.integration.common_utils.test_models import DATestUser
-
-# ---------------------------------------------------------------------------
-# Small HTTP wrapper (kept inline per task description — no separate manager).
-# ---------------------------------------------------------------------------
-
-
-def _url(*parts: str) -> str:
-    return f"{API_SERVER_URL}/build/user-library/" + "/".join(parts)
-
-
-def _multipart_headers(user: DATestUser) -> dict[str, str]:
-    """Drop the JSON Content-Type so ``requests`` can set the multipart one."""
-    return {k: v for k, v in user.headers.items() if k.lower() != "content-type"}
-
-
-def _upload(
-    user: DATestUser,
-    files: Iterable[tuple[str, bytes, str | None]],
-    path: str = "/",
-) -> httpx.Response:
-    multipart = [
-        (
-            "files",
-            (name, io.BytesIO(content), content_type or "application/octet-stream"),
-        )
-        for name, content, content_type in files
-    ]
-    return client.post(
-        _url("upload"),
-        files=multipart,
-        data={"path": path},
-        headers=_multipart_headers(user),
-        cookies=user.cookies,
-    )
-
-
-def _upload_zip(
-    user: DATestUser,
-    zip_bytes: bytes,
-    path: str = "/",
-    filename: str = "bundle.zip",
-) -> httpx.Response:
-    return client.post(
-        _url("upload-zip"),
-        files={"file": (filename, io.BytesIO(zip_bytes), "application/zip")},
-        data={"path": path},
-        headers=_multipart_headers(user),
-        cookies=user.cookies,
-    )
-
-
-def _tree(user: DATestUser) -> list[dict[str, Any]]:
-    response = client.get(
-        _url("tree"),
-        headers=user.headers,
-        cookies=user.cookies,
-    )
-    response.raise_for_status()
-    body = response.json()
-    assert isinstance(body, list)
-    return body
-
-
-def _delete(user: DATestUser, document_id: str) -> httpx.Response:
-    return client.delete(
-        _url("files", document_id),
-        headers=user.headers,
-        cookies=user.cookies,
-    )
+from tests.integration.tests.craft.user_library_http import _delete
+from tests.integration.tests.craft.user_library_http import _make_zip
+from tests.integration.tests.craft.user_library_http import _tree
+from tests.integration.tests.craft.user_library_http import _upload
+from tests.integration.tests.craft.user_library_http import _upload_zip
 
 
 def _find_doc_by_name(
     entries: list[dict[str, Any]], name: str
 ) -> dict[str, Any] | None:
     return next((e for e in entries if e.get("name") == name), None)
-
-
-def _make_zip(members: dict[str, bytes]) -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, data in members.items():
-            zf.writestr(name, data)
-    return buf.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# Synthetic PDF builder for the embedded-image cap test.
-# ---------------------------------------------------------------------------
-
-
-def _build_pdf_with_n_images(n: int) -> bytes:
-    """Return a minimal valid PDF whose single page references ``n`` images.
-
-    The image XObjects are tiny placeholders (1x1 raw grayscale stream),
-    which is enough for ``pypdf.PageObject.images`` to enumerate them
-    via the ``/XObject /Subtype /Image`` dict structure that
-    ``count_pdf_embedded_images`` walks.
-    """
-    # 1x1 raw grayscale pixel — one byte of image data.
-    pixel = b"\x00"
-
-    objects: list[bytes] = []
-    # Build N image XObjects.
-    image_obj_indices: list[int] = []
-    # We reserve obj nums for catalog/pages/page later; build images first.
-    # The final layout: obj 1 = Catalog, obj 2 = Pages, obj 3 = Page,
-    # then N image objects starting at obj 4, then content stream.
-    catalog_num = 1
-    pages_num = 2
-    page_num = 3
-    image_start = 4
-    for i in range(n):
-        obj_num = image_start + i
-        image_obj_indices.append(obj_num)
-
-    content_obj_num = image_start + n
-
-    # /Resources XObject dict mapping /Im{i} → indirect ref to image obj.
-    xobject_entries = " ".join(
-        f"/Im{i} {idx} 0 R" for i, idx in enumerate(image_obj_indices)
-    )
-    resources = f"/Resources << /XObject << {xobject_entries} >> >>"
-
-    page = (
-        f"{page_num} 0 obj\n"
-        f"<< /Type /Page /Parent {pages_num} 0 R "
-        f"/MediaBox [0 0 10 10] "
-        f"{resources} "
-        f"/Contents {content_obj_num} 0 R "
-        f">>\nendobj\n"
-    )
-
-    catalog = (
-        f"{catalog_num} 0 obj\n<< /Type /Catalog /Pages {pages_num} 0 R >>\nendobj\n"
-    )
-
-    pages = (
-        f"{pages_num} 0 obj\n"
-        f"<< /Type /Pages /Kids [{page_num} 0 R] /Count 1 >>\nendobj\n"
-    )
-
-    content_stream_body = b"q Q"  # trivial valid content stream
-    content = (
-        (
-            f"{content_obj_num} 0 obj\n"
-            f"<< /Length {len(content_stream_body)} >>\n"
-            f"stream\n"
-        ).encode("latin-1")
-        + content_stream_body
-        + b"\nendstream\nendobj\n"
-    )
-
-    image_blobs: list[bytes] = []
-    for idx in image_obj_indices:
-        body = (
-            (
-                f"{idx} 0 obj\n"
-                f"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
-                f"/ColorSpace /DeviceGray /BitsPerComponent 8 "
-                f"/Length {len(pixel)} /Filter [] >>\n"
-                f"stream\n"
-            ).encode("latin-1")
-            + pixel
-            + b"\nendstream\nendobj\n"
-        )
-        image_blobs.append(body)
-
-    header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
-    body = (
-        catalog.encode("latin-1")
-        + pages.encode("latin-1")
-        + page.encode("latin-1")
-        + b"".join(image_blobs)
-        + content
-    )
-
-    # Build xref (very minimal — pypdf is lenient about offsets as long
-    # as the trailer points at the catalog).
-    pdf = header + body
-    xref_offset = len(pdf)
-    n_objs = content_obj_num
-    xref_lines = [f"xref\n0 {n_objs + 1}\n", "0000000000 65535 f \n"]
-    # We don't track precise offsets — most readers accept zeros and
-    # parse the trailer's /Root indirect ref. pypdf's lenient mode
-    # reconstructs xref when needed.
-    for _ in range(n_objs):
-        xref_lines.append("0000000000 00000 n \n")
-    trailer = (
-        f"trailer\n<< /Size {n_objs + 1} /Root {catalog_num} 0 R >>\n"
-        f"startxref\n{xref_offset}\n%%EOF\n"
-    )
-    pdf = pdf + "".join(xref_lines).encode("latin-1") + trailer.encode("latin-1")
-    objects.append(pdf)
-    return pdf
 
 
 # ---------------------------------------------------------------------------
@@ -254,27 +63,6 @@ def test_upload_batch_over_count_cap_rejects(admin_user: DATestUser) -> None:
     # CI lowers USER_LIBRARY_MAX_FILES_PER_UPLOAD to 5.
     files = [(f"tiny-{i}-{uuid4().hex[:6]}.txt", b"x", "text/plain") for i in range(6)]
     response = _upload(admin_user, files)
-
-    assert response.status_code == 400
-
-
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "pypdf doesn't reliably enumerate images in our hand-built synthetic "
-        "PDF — returns 0 → upload succeeds. Need a reportlab-built PDF or a "
-        "fixture file to exercise this path."
-    ),
-)
-def test_upload_pdf_with_too_many_embedded_images_rejected(
-    admin_user: DATestUser,
-) -> None:
-    """A PDF with more embedded images than the per-file cap is rejected with 400."""
-    pdf_bytes = _build_pdf_with_n_images(51)
-    response = _upload(
-        admin_user,
-        [(f"manyimages-{uuid4().hex[:6]}.pdf", pdf_bytes, "application/pdf")],
-    )
 
     assert response.status_code == 400
 

@@ -35,15 +35,17 @@ from onyx.redis.redis_pool import get_redis_client
 from onyx.server.features.build.db.build_session import allocate_nextjs_port
 from onyx.server.features.build.db.build_session import get_user_build_sessions
 from onyx.server.features.build.db.sandbox import get_sandbox_by_user_id
+from onyx.server.features.build.db.sandbox import update_sandbox_status__no_commit
 from onyx.server.features.build.sandbox.models import SandboxInfo
 from onyx.server.features.build.sandbox.user_library import USER_LIBRARY_MOUNT_PATH
 from onyx.server.features.build.session.api import restore_session
+from onyx.server.features.build.session.errors import SandboxProvisioningError
 from onyx.server.features.build.session.manager import SessionManager
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
-from tests.external_dependency_unit.craft.conftest import (
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+from tests.common.craft.stubs import StubSandboxManager
+from tests.external_dependency_unit.craft.redis_helpers import (
     assert_lock_serializes_two_threads,
 )
-from tests.external_dependency_unit.craft.stubs import StubSandboxManager
 
 # Built-in skill rows are seeded by ``setup_postgres`` (run once per
 # tenant in ``full_setup``) and persist across tests. The session
@@ -252,6 +254,202 @@ class TestEmptySessionReuse:
         }
         assert stub_sandbox_manager.create_opencode_history_snapshot_count == 0
         assert stub_sandbox_manager.cleanup_session_workspace_count == 1
+
+
+# =============================================================================
+# ensure_sandbox_running — headless state machine
+# =============================================================================
+
+
+class TestEnsureSandboxRunning:
+    """State-machine coverage for ``SessionManager.ensure_sandbox_running``.
+
+    The headless entry point (used by scheduled tasks) that brings a user's
+    sandbox to RUNNING without creating a session row. Restored from the
+    deleted ``test_ensure_sandbox_running.py`` and reframed against the
+    ``StubSandboxManager``: the stub can represent every status the state
+    machine branches on (healthy/unhealthy via ``health_check_returns``,
+    dormant/provisioning via the DB row), so the recovery/wake/timeout
+    branches no longer need a live K8s pod.
+    """
+
+    def test_creates_sandbox_when_none_exists(
+        self,
+        db_session: Session,
+        test_user: User,
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+    ) -> None:
+        assert get_sandbox_by_user_id(db_session, test_user.id) is None
+
+        stub_sandbox_manager.provision_returns = SandboxInfo(
+            sandbox_id=uuid4(),
+            directory_path="/tmp/sandbox",
+            status=SandboxStatus.RUNNING,
+            last_heartbeat=None,
+        )
+
+        sandbox_row = session_manager_with_stub.ensure_sandbox_running(test_user.id)
+        db_session.commit()
+
+        assert sandbox_row.user_id == test_user.id
+        assert sandbox_row.status == SandboxStatus.RUNNING
+        assert stub_sandbox_manager.provision_count == 1
+
+    def test_running_and_healthy_returns_as_is(
+        self,
+        test_user: User,
+        sandbox: Callable[..., Sandbox],
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+    ) -> None:
+        existing = sandbox(user=test_user, status=SandboxStatus.RUNNING)
+        stub_sandbox_manager.health_check_returns = True
+        # provision_returns / terminate_silent left unset: any call raises.
+
+        result = session_manager_with_stub.ensure_sandbox_running(test_user.id)
+
+        assert result.id == existing.id
+        assert result.status == SandboxStatus.RUNNING
+        assert stub_sandbox_manager.provision_count == 0
+        assert stub_sandbox_manager.terminate_count == 0
+        assert stub_sandbox_manager.health_check_count >= 1
+
+    def test_running_but_unhealthy_recovers_via_terminate_then_provision(
+        self,
+        db_session: Session,
+        test_user: User,
+        sandbox: Callable[..., Sandbox],
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+    ) -> None:
+        existing = sandbox(user=test_user, status=SandboxStatus.RUNNING)
+        stub_sandbox_manager.health_check_returns = False
+        stub_sandbox_manager.terminate_silent = True
+        stub_sandbox_manager.supports_opencode_history_persistence = True
+        stub_sandbox_manager.create_opencode_history_snapshot_returns = True
+        stub_sandbox_manager.provision_returns = SandboxInfo(
+            sandbox_id=existing.id,
+            directory_path="/tmp/sandbox",
+            status=SandboxStatus.RUNNING,
+            last_heartbeat=None,
+        )
+
+        result = session_manager_with_stub.ensure_sandbox_running(test_user.id)
+        db_session.commit()
+
+        # Recovery cycle: snapshot opencode history, terminate the dead pod,
+        # then re-provision in place.
+        assert result.id == existing.id
+        assert result.status == SandboxStatus.RUNNING
+        assert stub_sandbox_manager.create_opencode_history_snapshot_count == 1
+        assert stub_sandbox_manager.terminate_count == 1
+        assert stub_sandbox_manager.last_terminate_sandbox_id == existing.id
+        assert stub_sandbox_manager.provision_count == 1
+
+    @pytest.mark.parametrize(
+        "initial_status",
+        [
+            SandboxStatus.SLEEPING,
+            SandboxStatus.TERMINATED,
+            SandboxStatus.FAILED,
+        ],
+    )
+    def test_wakes_dormant_sandbox(
+        self,
+        db_session: Session,
+        test_user: User,
+        sandbox: Callable[..., Sandbox],
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+        initial_status: SandboxStatus,
+    ) -> None:
+        existing = sandbox(user=test_user, status=initial_status)
+        stub_sandbox_manager.provision_returns = SandboxInfo(
+            sandbox_id=existing.id,
+            directory_path="/tmp/sandbox",
+            status=SandboxStatus.RUNNING,
+            last_heartbeat=None,
+        )
+        # health_check / terminate left unset: a dormant sandbox is revived
+        # in place without a health probe or terminate.
+
+        result = session_manager_with_stub.ensure_sandbox_running(test_user.id)
+        db_session.commit()
+
+        assert result.id == existing.id
+        assert result.status == SandboxStatus.RUNNING
+        assert stub_sandbox_manager.provision_count == 1
+        assert stub_sandbox_manager.terminate_count == 0
+
+    def test_provisioning_transitions_to_running_during_wait(
+        self,
+        db_session: Session,
+        test_user: User,
+        sandbox: Callable[..., Sandbox],
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A concurrent provisioner finishes mid-wait: we observe RUNNING and
+        # return without provisioning ourselves.
+        existing = sandbox(user=test_user, status=SandboxStatus.PROVISIONING)
+        stub_sandbox_manager.health_check_returns = True
+
+        # The poll loop sleeps between DB refreshes; flip the row to RUNNING
+        # on the first sleep to simulate the other provisioner committing.
+        flipped: list[bool] = [False]
+
+        def _flipping_sleep(_seconds: float) -> None:
+            if not flipped[0]:
+                flipped[0] = True
+                update_sandbox_status__no_commit(
+                    db_session, existing.id, SandboxStatus.RUNNING
+                )
+                db_session.commit()
+
+        monkeypatch.setattr(
+            "onyx.server.features.build.session.sandbox_lifecycle.time.sleep",
+            _flipping_sleep,
+        )
+
+        result = session_manager_with_stub.ensure_sandbox_running(
+            test_user.id,
+            provisioning_wait_seconds=10.0,
+        )
+
+        assert result.id == existing.id
+        assert result.status == SandboxStatus.RUNNING
+        # We never re-provisioned: the concurrent provisioner already did.
+        assert stub_sandbox_manager.provision_count == 0
+
+    def test_provisioning_times_out_raises(
+        self,
+        test_user: User,
+        sandbox: Callable[..., Sandbox],
+        session_manager_with_stub: SessionManager,
+        stub_sandbox_manager: StubSandboxManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Stuck PROVISIONING: the deadline elapses without a transition, so we
+        # raise rather than provisioning ourselves.
+        sandbox(user=test_user, status=SandboxStatus.PROVISIONING)
+
+        def _sleep_noop(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "onyx.server.features.build.session.sandbox_lifecycle.time.sleep",
+            _sleep_noop,
+        )
+
+        with pytest.raises(SandboxProvisioningError):
+            session_manager_with_stub.ensure_sandbox_running(
+                test_user.id,
+                provisioning_wait_seconds=0.0,
+            )
+
+        assert stub_sandbox_manager.provision_count == 0
 
 
 # =============================================================================
@@ -838,11 +1036,9 @@ class TestPortAllocator:
         test_user: User,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Plan calls for OnyxError here, but the implementation in
-        # ``onyx.server.features.build.db.build_session.allocate_nextjs_port``
-        # raises ``RuntimeError`` with the documented "No available ports"
-        # message. We pin the current behaviour and flag the divergence in
-        # the report. See manager.py / build_session.py for the call sites.
+        # Pins current behavior: exhausting the range raises a bare
+        # ``RuntimeError``. (The project standard would be ``OnyxError``; that
+        # divergence is for ``allocate_nextjs_port`` to address, not this test.)
         monkeypatch.setattr(
             "onyx.server.features.build.db.build_session.SANDBOX_NEXTJS_PORT_START",
             50100,
@@ -882,7 +1078,9 @@ class TestConcurrentCreateLock:
         # Same lock contract as sessions_api.create_session: lock key is
         # ``session_create:{user_id}``. Two threads contend; the second
         # observes the first holding it.
-        redis_client = get_redis_client(tenant_id=TEST_TENANT_ID)
+        redis_client = get_redis_client(
+            tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+        )
         lock_key = f"session_create:{test_user.id}"
 
         assert_lock_serializes_two_threads(redis_client, lock_key)
@@ -971,7 +1169,7 @@ class TestRestoreSession:
         snapshot = Snapshot(
             id=uuid4(),
             session_id=idle_session.id,
-            storage_path=f"{TEST_TENANT_ID}/snapshots/{idle_session.id}/latest.tar.gz",
+            storage_path=f"{POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE}/snapshots/{idle_session.id}/latest.tar.gz",
             size_bytes=123,
         )
         db_session.add(snapshot)

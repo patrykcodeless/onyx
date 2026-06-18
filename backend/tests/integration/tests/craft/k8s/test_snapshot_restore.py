@@ -1,11 +1,15 @@
-"""Snapshot + restore (K8s only).
+"""Snapshot + restore coverage in the full Craft k8s integration lane.
 
-These tests exercise the real Kubernetes snapshot/restore flow:
+These tests run inside the Helm-installed kind stack with real API/web/Celery,
+backing services, sandbox proxy, and sandbox pods. Most tests exercise the real
+Kubernetes sidecar snapshot/restore contract directly:
 - Pods are provisioned via ``KubernetesSandboxManager``.
 - Snapshots are streamed from the pod sidecar to the API server, then persisted
   through the normal Onyx FileStore.
 - Verification downloads the resulting tarball via FileStore and inspects its
   members locally with ``tmp_path``.
+Product restore orchestration is covered through the deployed
+``/build/sessions/{id}/restore`` API.
 
 The file-level ``pytestmark`` gates the entire module to the K8s CI lane.
 Per project memory: never run these locally — they touch the real cluster.
@@ -16,26 +20,34 @@ from __future__ import annotations
 import io
 import shutil
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 from uuid import uuid4
 
 import pytest
 from kubernetes import client
+from sqlalchemy.orm import Session
 
 from onyx.configs.constants import FileOrigin
 from onyx.file_store.file_store import get_default_file_store
 from onyx.server.features.build.configs import SANDBOX_BACKEND
 from onyx.server.features.build.configs import SANDBOX_NAMESPACE
 from onyx.server.features.build.configs import SandboxBackend
+from onyx.server.features.build.db.sandbox import create_snapshot__no_commit
 from onyx.server.features.build.sandbox.kubernetes.kubernetes_sandbox_manager import (
     KubernetesSandboxManager,
 )
 from onyx.server.features.build.sandbox.snapshot_manager import SNAPSHOT_FILE_TYPE
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
-from tests.external_dependency_unit.craft._test_helpers import default_llm_config
-from tests.external_dependency_unit.craft.conftest import pod_exec
-from tests.external_dependency_unit.craft.conftest import wait_for_pod_deletion
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+from tests.common.craft.payloads import default_llm_config
+from tests.integration.common_utils.managers.build_session import BuildSessionManager
+from tests.integration.common_utils.managers.skill import SkillManager
+from tests.integration.common_utils.test_models import DATestUser
+from tests.integration.tests.craft.k8s.k8s_fixtures import cleanup_api_user_sandbox_rows
+from tests.integration.tests.craft.k8s.k8s_fixtures import pod_exec
+from tests.integration.tests.craft.k8s.k8s_fixtures import SandboxHandle
+from tests.integration.tests.craft.k8s.k8s_fixtures import wait_for_pod_deletion
 
 pytestmark = pytest.mark.skipif(
     SANDBOX_BACKEND != SandboxBackend.KUBERNETES,
@@ -149,7 +161,9 @@ def test_snapshot_includes_outputs_and_attachments_only(
 
     _populate_session_workspace(k8s_client, pod_name, session_id)
 
-    result = k8s_manager.create_snapshot(sandbox_id, session_id, TEST_TENANT_ID)
+    result = k8s_manager.create_snapshot(
+        sandbox_id, session_id, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert result is not None, "create_snapshot returned None for populated session"
 
     archive = tmp_path / "snapshot.tar.gz"
@@ -188,7 +202,9 @@ def test_snapshot_excludes_managed_skills_agents_md_opencode_json(
         k8s_client, pod_name, session_id, include_managed_skills=True
     )
 
-    result = k8s_manager.create_snapshot(sandbox_id, session_id, TEST_TENANT_ID)
+    result = k8s_manager.create_snapshot(
+        sandbox_id, session_id, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert result is not None
 
     archive = tmp_path / "snapshot.tar.gz"
@@ -222,7 +238,9 @@ def test_restore_from_snapshot_recreates_workspace(
     sandbox_id, session_id, pod_name = pool_session
 
     payload = _populate_session_workspace(k8s_client, pod_name, session_id)
-    result = k8s_manager.create_snapshot(sandbox_id, session_id, TEST_TENANT_ID)
+    result = k8s_manager.create_snapshot(
+        sandbox_id, session_id, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert result is not None
 
     # Capture the file hashes before tearing down the workspace.
@@ -286,70 +304,72 @@ def test_restore_from_snapshot_recreates_workspace(
 def test_restore_re_pushes_skills(
     k8s_manager: KubernetesSandboxManager,
     k8s_client: client.CoreV1Api,
-    pool_session: tuple[UUID, UUID, str],
+    k8s_admin_user: DATestUser,
+    running_sandbox: Callable[..., SandboxHandle],
+    tenant_context: None,  # noqa: ARG001
+    db_session: Session,
 ) -> None:
-    sandbox_id, session_id, pod_name = pool_session
+    handle = running_sandbox(with_session=True)
+    assert handle.session_id is not None
+    sandbox_id = handle.sandbox_id
+    session_id = handle.session_id
+    pod_name = handle.manager._get_pod_name(sandbox_id)
 
     _populate_session_workspace(k8s_client, pod_name, session_id)
-    result = k8s_manager.create_snapshot(sandbox_id, session_id, TEST_TENANT_ID)
+    result = k8s_manager.create_snapshot(
+        sandbox_id, session_id, POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+    )
     assert result is not None
-
-    # Wipe the managed/skills tree to simulate a fresh post-restore state.
-    # In production the caller (sessions_api) follows up restore_snapshot
-    # with hydrate_sandbox_skills; this test verifies that push works
-    # against a snapshot-restored workspace. The wipe must run in the
-    # sidecar — ``/workspace/managed`` is read-only in the sandbox container.
-    pod_exec(
-        k8s_client,
-        pod_name,
-        SANDBOX_NAMESPACE,
-        "rm -rf /workspace/managed/skills && mkdir -p /workspace/managed",
-        container="sidecar",
-    )
-
-    # Restore the session.
-    k8s_manager.cleanup_session_workspace(sandbox_id, session_id)
-    k8s_manager.restore_snapshot(
-        sandbox_id=sandbox_id,
+    create_snapshot__no_commit(
+        db_session,
         session_id=session_id,
-        snapshot_storage_path=result.storage_path,
-        nextjs_port=None,
-        llm_config=default_llm_config(),
-        skills_section="No skills available.",
+        storage_path=result.storage_path,
+        size_bytes=result.size_bytes,
     )
+    db_session.commit()
 
-    # Push a synthetic skill via the manager (this is the same code path
-    # that ``hydrate_sandbox_skills`` exercises after a successful restore).
-    fileset = {
-        "marker-skill/SKILL.md": (b"---\nname: marker-skill\ndescription: test\n---\n"),
-        "marker-skill/run.sh": b"#!/bin/sh\necho ok\n",
-    }
-    k8s_manager.push_to_sandbox(
-        sandbox_id=sandbox_id,
-        mount_path="/workspace/managed/skills",
-        files=fileset,
+    skill = SkillManager.create_custom(
+        k8s_admin_user,
+        slug=f"restore-repush-{uuid4().hex[:6]}",
+        is_public=True,
     )
+    try:
+        # Wipe the managed/skills tree to simulate a fresh post-restore state.
+        # The wipe must run in the sidecar — ``/workspace/managed`` is read-only in
+        # the sandbox container.
+        pod_exec(
+            k8s_client,
+            pod_name,
+            SANDBOX_NAMESPACE,
+            "rm -rf /workspace/managed/skills && mkdir -p /workspace/managed",
+            container="sidecar",
+        )
 
-    listing = pod_exec(
-        k8s_client,
-        pod_name,
-        SANDBOX_NAMESPACE,
-        "ls -1 /workspace/managed/skills/marker-skill/",
-    )
-    assert "SKILL.md" in listing, (
-        f"Restored workspace should accept skill push. Got: {listing}"
-    )
-    assert "run.sh" in listing
+        k8s_manager.cleanup_session_workspace(sandbox_id, session_id)
+        response = BuildSessionManager.restore_session(handle.api_user, session_id)
+        assert response["session_loaded_in_sandbox"] is True
 
-    # The session's .opencode/skills symlink should resolve to the
-    # repopulated managed/skills tree.
-    resolved = pod_exec(
-        k8s_client,
-        pod_name,
-        SANDBOX_NAMESPACE,
-        f"ls -1 /workspace/sessions/{session_id}/.opencode/skills/marker-skill/",
-    )
-    assert "SKILL.md" in resolved
+        listing = pod_exec(
+            k8s_client,
+            pod_name,
+            SANDBOX_NAMESPACE,
+            f"ls -1 /workspace/managed/skills/{skill.slug}/",
+        )
+        assert "SKILL.md" in listing, (
+            f"API restore should rehydrate skills after snapshot restore. Got: {listing}"
+        )
+
+        # The session's .opencode/skills symlink should resolve to the
+        # repopulated managed/skills tree.
+        resolved = pod_exec(
+            k8s_client,
+            pod_name,
+            SANDBOX_NAMESPACE,
+            f"ls -1 /workspace/sessions/{session_id}/.opencode/skills/{skill.slug}/",
+        )
+        assert "SKILL.md" in resolved
+    finally:
+        SkillManager.delete_custom(skill, k8s_admin_user)
 
 
 def test_restore_with_missing_snapshot_creates_fresh_workspace(
@@ -402,27 +422,32 @@ def test_opencode_history_snapshot_restores_into_reprovisioned_pod(
 
     assert k8s_manager.create_opencode_history_snapshot(
         sandbox_id,
-        TEST_TENANT_ID,
+        POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE,
     )
 
     k8s_manager.terminate(sandbox_id)
     wait_for_pod_deletion(k8s_client, pod_name, SANDBOX_NAMESPACE)
 
+    # Re-provision under a throwaway user; clean its Sandbox row explicitly
+    # since live_pod's teardown only reaps the original owner's rows.
+    reprovision_user_id = uuid4()
     k8s_manager.provision(
         sandbox_id=sandbox_id,
-        user_id=uuid4(),
-        tenant_id=TEST_TENANT_ID,
+        user_id=reprovision_user_id,
+        tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE,
         llm_config=default_llm_config(),
         onyx_pat="test-onyx-pat",
     )
-
-    restored = pod_exec(
-        k8s_client,
-        pod_name,
-        SANDBOX_NAMESPACE,
-        f"cat {marker_path}",
-    )
-    assert restored == "restored-opencode-history"
+    try:
+        restored = pod_exec(
+            k8s_client,
+            pod_name,
+            SANDBOX_NAMESPACE,
+            f"cat {marker_path}",
+        )
+        assert restored == "restored-opencode-history"
+    finally:
+        cleanup_api_user_sandbox_rows(reprovision_user_id)
 
 
 def test_restore_uses_data_filter_to_block_traversal(
@@ -469,7 +494,7 @@ def test_restore_uses_data_filter_to_block_traversal(
         evil_info.size = len(evil_payload)
         tar.addfile(evil_info, fileobj=io.BytesIO(evil_payload))
 
-    storage_path = f"{TEST_TENANT_ID}/snapshots/{session_id}/traversal.tar.gz"
+    storage_path = f"{POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE}/snapshots/{session_id}/traversal.tar.gz"
     _put_snapshot_bytes(storage_path, archive_local.read_bytes())
 
     # Attempt to restore. Traversal must be rejected before extraction.
@@ -534,7 +559,7 @@ def test_snapshot_corruption_detected_on_restore(
 
     # Forge a truncated gzip blob — valid gzip header, garbage body.
     corrupt_bytes = b"\x1f\x8b\x08\x00" + b"\x00" * 8 + b"truncated-mid-stream"
-    storage_path = f"{TEST_TENANT_ID}/snapshots/{session_id}/corrupt.tar.gz"
+    storage_path = f"{POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE}/snapshots/{session_id}/corrupt.tar.gz"
     _put_snapshot_bytes(storage_path, corrupt_bytes)
 
     # Restore should raise a SnapshotCorruption-class error (or at minimum

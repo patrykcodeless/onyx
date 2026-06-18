@@ -160,6 +160,25 @@ class BuildSessionManager:
         return response.json()
 
     @staticmethod
+    def delete_session(user: DATestUser, session_id: UUID) -> None:
+        response = client.delete(
+            _sessions_url(str(session_id)),
+            headers=user.headers,
+            cookies=user.cookies,
+        )
+        response.raise_for_status()
+
+    @staticmethod
+    def restore_session(user: DATestUser, session_id: UUID) -> dict[str, Any]:
+        response = client.post(
+            _sessions_url(str(session_id), "restore"),
+            headers=user.headers,
+            cookies=user.cookies,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
     def delete_file(
         user: DATestUser,
         session_id: UUID,

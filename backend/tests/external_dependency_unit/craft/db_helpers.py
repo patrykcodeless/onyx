@@ -1,15 +1,16 @@
-"""Shared row factories for craft external-dependency tests.
+"""Shared Craft database row factories.
 
-Underscore-prefixed module so pytest does not collect it. Helpers live here
-(not in ``conftest.py``) because they're plain functions — callers want to
-import them, not receive them as fixtures.
+Helpers live here, not in a ``conftest.py``, because they're plain functions:
+external-dependency tests import row factories directly. Pure payload builders
+live in ``tests.common.craft.payloads`` so integration tests do not depend on
+DB factory modules for value construction.
 
 Conventions:
 
 - Every helper takes ``db_session`` as the first argument and flushes (does not
   commit) so the surrounding test owns transaction boundaries.
 - Every helper returns the created row.
-- IDs and emails are randomised per call so tests can run in parallel against
+- IDs and emails are randomized per call so tests can run in parallel against
   the same Postgres without colliding.
 """
 
@@ -25,17 +26,11 @@ from sqlalchemy import delete
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from onyx.configs.constants import DocumentSource
-from onyx.db.enums import AccessType
 from onyx.db.enums import AccountType
-from onyx.db.enums import ConnectorCredentialPairStatus
 from onyx.db.enums import EndpointPolicy
 from onyx.db.enums import ExternalAppType
 from onyx.db.enums import SandboxStatus
 from onyx.db.models import ActionApproval
-from onyx.db.models import Connector
-from onyx.db.models import ConnectorCredentialPair
-from onyx.db.models import Credential
 from onyx.db.models import ExternalApp
 from onyx.db.models import ExternalAppPolicy
 from onyx.db.models import ExternalAppUserCredential
@@ -45,13 +40,10 @@ from onyx.db.models import Skill__UserGroup
 from onyx.db.models import User
 from onyx.db.models import User__UserGroup
 from onyx.db.models import UserGroup
-from onyx.db.models import UserGroup__ConnectorCredentialPair
 from onyx.db.models import UserRole
-from onyx.external_apps.matching.engine import MatchedAction
-from onyx.server.features.build.sandbox.models import LLMProviderConfig
 
 
-def _set_created_at(
+def set_session_created_at(
     db_session: Session,
     model: type[ActionApproval],
     pk: UUID,
@@ -270,112 +262,3 @@ def grant_skill_to_group(
     db_session.add(grant)
     db_session.flush()
     return grant
-
-
-def make_cc_pair(
-    db_session: Session,
-    source: DocumentSource,
-    *,
-    user: User | None = None,
-    access_type: AccessType = AccessType.PUBLIC,
-    group: UserGroup | None = None,
-    name_prefix: str = "test",
-) -> ConnectorCredentialPair:
-    """Create a Connector + Credential + ConnectorCredentialPair row trio.
-
-    For per-user visibility tests:
-    - ``access_type=PUBLIC`` + ``user=None`` → visible to everyone (default).
-    - ``access_type=PRIVATE`` + ``user=<user>`` → visible only to creator
-      (the creator-id branch of ``_add_user_filters``).
-    - ``access_type=PRIVATE`` + ``group=<group>`` → visible only via the
-      ``UserGroup__ConnectorCredentialPair`` mapping; pass ``user=None`` to
-      test pure group-based visibility (the credential's ``user_id`` is also
-      left ``None`` so the creator-id branch can't accidentally match).
-
-    The ``user`` argument controls both ``Credential.user_id`` and
-    ``ConnectorCredentialPair.creator_id``. When supplied with PUBLIC, it is
-    set on both for convenience. When ``user`` is None for PRIVATE+group, both
-    are explicitly None so visibility comes solely from the group mapping.
-    """
-    suffix = uuid4().hex[:6]
-    connector = Connector(
-        name=f"{name_prefix}-{source.value}-{suffix}",
-        source=source,
-        input_type=None,
-        connector_specific_config={},
-    )
-    db_session.add(connector)
-    db_session.flush()
-
-    credential = Credential(
-        credential_json={},
-        user_id=user.id if user is not None else None,
-        source=source,
-    )
-    db_session.add(credential)
-    db_session.flush()
-
-    cc_pair = ConnectorCredentialPair(
-        name=f"{name_prefix}-cc-{suffix}",
-        connector_id=connector.id,
-        credential_id=credential.id,
-        status=ConnectorCredentialPairStatus.ACTIVE,
-        access_type=access_type,
-        creator_id=user.id if user is not None else None,
-    )
-    db_session.add(cc_pair)
-    db_session.flush()
-
-    if group is not None:
-        db_session.add(
-            UserGroup__ConnectorCredentialPair(
-                user_group_id=group.id,
-                cc_pair_id=cc_pair.id,
-            )
-        )
-        db_session.flush()
-
-    return cc_pair
-
-
-def default_llm_config(
-    provider: str = "openai",
-    model_name: str = "gpt-5-mini",
-    api_key: str = "test-key",
-) -> LLMProviderConfig:
-    """Standard ``LLMProviderConfig`` for tests that don't care about specifics."""
-    return LLMProviderConfig(
-        provider=provider,
-        model_name=model_name,
-        api_key=api_key,
-        api_base=None,
-    )
-
-
-def action_entry(
-    action_type: str,
-    *,
-    display_name: str = "Action",
-    description: str = "An action.",
-    policy: EndpointPolicy = EndpointPolicy.ASK,
-) -> dict[str, Any]:
-    """JSONB-shape dict for one `ActionApproval.actions` entry. Routes
-    through `MatchedAction` so the shape can't drift from the production
-    model."""
-    return MatchedAction(
-        action_type=action_type,
-        display_name=display_name,
-        description=description,
-        policy=policy,
-    ).model_dump(mode="json")
-
-
-def default_action_entries() -> list[dict[str, Any]]:
-    """Single ASK entry for tests that don't care about catalog specifics."""
-    return [
-        action_entry(
-            "shell.exec",
-            display_name="Run command",
-            description="Run a shell command.",
-        )
-    ]

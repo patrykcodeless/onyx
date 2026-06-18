@@ -1,70 +1,65 @@
-"""Approval-gate end-to-end (real proxy + Redis + sandbox pod + Postgres).
+"""Approval-gate tests in the full Craft k8s integration lane.
 
-Gated to the K8s CI lane via ``pytestmark`` — never run locally (touches the
-real cluster). Each test provisions a sandbox pod, seeds a User + BuildSession,
-drives a real sandbox-side curl against slack.com tagged with the session id (as
-the opencode plugin does in production), and asserts the ApprovalDecision flow.
-Complements the in-process ``test_approvals_api.py`` by exercising the real
-proxy/Redis/SIGTERM-drain paths.
+Runs against real API/web/Celery/backing services, sandbox proxy, and sandbox
+pods from the Helm-installed kind stack. Each test uses the deployed API to
+create user/session state, drives a real sandbox-side curl against slack.com
+tagged with the session id (as the opencode plugin does in production), and
+asserts the ApprovalDecision flow. Complements the in-process
+``test_approvals_api.py`` by exercising the real proxy/Redis/SIGTERM-drain
+paths.
 
 Run with::
 
     SANDBOX_BACKEND=kubernetes python -m dotenv -f .vscode/.env run -- \\
-        pytest backend/tests/external_dependency_unit/craft/test_approval_gate.py -v
+        pytest backend/tests/integration/tests/craft/k8s/test_approval_gate.py -v
 """
 
 from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
-from typing import Generator
+from collections.abc import Generator
 from uuid import UUID
 from uuid import uuid4
 
+import httpx
 import pytest
 from kubernetes import client
-from sqlalchemy import select
-from sqlalchemy import text
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from onyx.auth.schemas import UserRole as AuthUserRole
 from onyx.cache.factory import get_cache_backend
 from onyx.configs.constants import NotificationType
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
-from onyx.db.engine.sql_engine import SqlEngine
 from onyx.db.enums import ApprovalDecision
 from onyx.db.enums import BuildSessionStatus
 from onyx.db.enums import EndpointPolicy
 from onyx.db.enums import ExternalAppType
-from onyx.db.external_app import create_external_app
-from onyx.db.external_app import get_built_in_external_app
 from onyx.db.models import ActionApproval
 from onyx.db.models import BuildSession
 from onyx.db.models import Notification
 from onyx.db.models import Sandbox
 from onyx.db.models import User
 from onyx.error_handling.error_codes import OnyxErrorCode
-from onyx.error_handling.exceptions import OnyxError
 from onyx.sandbox_proxy import approval_cache
-from onyx.server.features.build.approvals.api import DecisionBody
-from onyx.server.features.build.approvals.api import list_live_approvals
-from onyx.server.features.build.approvals.api import submit_decision
 from onyx.server.features.build.configs import SANDBOX_BACKEND
 from onyx.server.features.build.configs import SANDBOX_NAMESPACE
 from onyx.server.features.build.configs import SANDBOX_PROXY_NAMESPACE
 from onyx.server.features.build.configs import SANDBOX_PROXY_PORT
 from onyx.server.features.build.configs import SandboxBackend
+from onyx.server.features.build.external_apps.models import ExternalAppAdminResponse
 from onyx.utils.logger import setup_logger
-from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
-from tests.external_dependency_unit.constants import TEST_TENANT_ID
-from tests.external_dependency_unit.craft._test_helpers import action_entry
-from tests.external_dependency_unit.craft.conftest import pod_exec
-from tests.external_dependency_unit.craft.conftest import pod_exec_async
-from tests.external_dependency_unit.craft.conftest import wait_for_pod_exec_output
-from tests.external_dependency_unit.craft.conftest import wait_for_proxy_redeploy
+from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
+from tests.integration.common_utils.constants import API_SERVER_URL
+from tests.integration.common_utils.constants import GENERAL_HEADERS
+from tests.integration.common_utils.http_client import client as http_client
+from tests.integration.common_utils.managers.external_app import ExternalAppManager
+from tests.integration.common_utils.managers.user import DEFAULT_PASSWORD
+from tests.integration.common_utils.managers.user import UserManager
+from tests.integration.common_utils.test_models import DATestUser
+from tests.integration.tests.craft.k8s.k8s_fixtures import pod_exec
+from tests.integration.tests.craft.k8s.k8s_fixtures import pod_exec_async
+from tests.integration.tests.craft.k8s.k8s_fixtures import wait_for_pod_exec_output
+from tests.integration.tests.craft.k8s.k8s_fixtures import wait_for_proxy_redeploy
 
 logger = setup_logger()
 
@@ -84,8 +79,47 @@ _SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 _WAIT_TIMEOUT_S_SPEC = 180
 
 
+def _upsert_slack_external_app(
+    admin_user: DATestUser,
+    *,
+    organization_credentials: dict[str, str],
+) -> tuple[int, ExternalAppAdminResponse | None]:
+    existing = next(
+        (
+            app
+            for app in ExternalAppManager.list_admin(admin_user)
+            if app.app_type == ExternalAppType.SLACK
+        ),
+        None,
+    )
+    kwargs = {
+        "name": "Slack",
+        "description": "Slack integration for gate-flow K8s tests.",
+        "app_type": ExternalAppType.SLACK,
+        "upstream_url_patterns": ["https://slack\\.com/api/.*"],
+        "auth_template": {"Authorization": "Bearer {access_token}"},
+        "organization_credentials": organization_credentials,
+        "enabled": True,
+        "action_policies": {"slack.messages.write": EndpointPolicy.ASK},
+    }
+    if existing is None:
+        created = ExternalAppManager.create(admin_user, **kwargs)
+        return created.id, None
+
+    updated = ExternalAppManager.update(admin_user, existing.id, **kwargs)
+    return updated.id, existing
+
+
+def _action_policies_for_restore(
+    app: ExternalAppAdminResponse,
+) -> dict[str, EndpointPolicy]:
+    return {action.action_id: action.state for action in app.actions}
+
+
 @pytest.fixture(scope="module", autouse=True)
-def _seed_slack_external_app() -> Generator[None, None, None]:
+def _seed_slack_external_app(
+    k8s_admin_user: DATestUser,
+) -> Generator[None, None, None]:
     """
     Seeds an enabled Slack ``external_app`` so the matcher claims
     ``chat.postMessage``. The K8s lane doesn't auto-provision
@@ -95,37 +129,34 @@ def _seed_slack_external_app() -> Generator[None, None, None]:
 
     Survives the per-test ``_isolate_skill_tables`` snapshot/restore because it
     commits before the first test in this module runs -- the isolation fixture's
-    baseline captures it and restores it after each test. Idempotent: skips if a
-    Slack row already exists.
+    baseline captures it and restores it after each test.
     """
-    SqlEngine.init_engine(pool_size=10, max_overflow=5)
-    token = CURRENT_TENANT_ID_CONTEXTVAR.set(TEST_TENANT_ID)
+    app_id, previous = _upsert_slack_external_app(
+        k8s_admin_user,
+        # Fake token. An unfillable template short-circuits the ASK gate
+        # (forwards bare, no DB row), which breaks every gate-flow test below.
+        # ``test_ask_with_uninvokable_app_forwards_bare`` strips this back out
+        # through the admin API to exercise that short-circuit path.
+        organization_credentials={"access_token": "fake-test-token"},
+    )
     try:
-        with get_session_with_current_tenant() as session:
-            if get_built_in_external_app(session, ExternalAppType.SLACK) is None:
-                create_external_app(
-                    db_session=session,
-                    name="Slack",
-                    description="Slack integration for gate-flow K8s tests.",
-                    bundle_file_id="",
-                    bundle_sha256="",
-                    app_type=ExternalAppType.SLACK,
-                    upstream_url_patterns=["https://slack\\.com/api/.*"],
-                    auth_template={"Authorization": "Bearer {access_token}"},
-                    # Fake token. An unfillable template short-circuits the ASK
-                    # gate (forwards bare, no DB row), which breaks every
-                    # gate-flow test below. ``test_ask_with_uninvokable_app_
-                    # forwards_bare`` strips this back out to exercise that
-                    # short-circuit path.
-                    organization_credentials={"access_token": "fake-test-token"},
-                    enabled=True,
-                    is_public=True,
-                    action_policies={"slack.messages.write": EndpointPolicy.ASK},
-                )
-                session.commit()
         yield
     finally:
-        CURRENT_TENANT_ID_CONTEXTVAR.reset(token)
+        if previous is None:
+            ExternalAppManager.delete(k8s_admin_user, app_id)
+        else:
+            ExternalAppManager.update(
+                k8s_admin_user,
+                previous.id,
+                name=previous.name,
+                description=previous.description,
+                app_type=previous.app_type,
+                upstream_url_patterns=previous.upstream_url_patterns,
+                auth_template=previous.auth_template,
+                organization_credentials=previous.organization_credentials,
+                enabled=previous.enabled,
+                action_policies=_action_policies_for_restore(previous),
+            )
 
 
 def _post_slack_via_curl(
@@ -255,18 +286,57 @@ def _assert_403_error_code(body: str, expected_code: str) -> None:
     )
 
 
+def _approvals_url(*parts: object) -> str:
+    return f"{API_SERVER_URL}/build/approvals/" + "/".join(str(part) for part in parts)
+
+
+def _api_user_from_db_user(user: User) -> DATestUser:
+    return UserManager.login_as_user(
+        DATestUser(
+            id=str(user.id),
+            email=user.email,
+            password=DEFAULT_PASSWORD,
+            headers=GENERAL_HEADERS.copy(),
+            role=AuthUserRole(user.role.value),
+            is_active=True,
+        )
+    )
+
+
+def _submit_decision_response(
+    api_user: DATestUser,
+    approval_id: UUID,
+    decision: ApprovalDecision,
+) -> httpx.Response:
+    return http_client.post(
+        _approvals_url(approval_id, "decision"),
+        json={"decision": decision.value},
+        headers=api_user.headers,
+        cookies=api_user.cookies,
+    )
+
+
+def _submit_decision(
+    api_user: DATestUser,
+    approval_id: UUID,
+    decision: ApprovalDecision,
+) -> dict[str, object]:
+    response = _submit_decision_response(api_user, approval_id, decision)
+    response.raise_for_status()
+    body = response.json()
+    assert isinstance(body, dict)
+    return body
+
+
 @pytest.fixture(scope="function")
 def gated_session(
     db_session: Session,
     live_pod: tuple[UUID, UUID, str],
-) -> Generator[tuple[User, UUID, str], None, None]:
-    """Seeds an ACTIVE ``BuildSession`` matching ``live_pod``'s ids.
+) -> Generator[tuple[DATestUser, UUID, str], None, None]:
+    """Resolve the API-created active ``BuildSession`` backing ``live_pod``.
 
-    ``live_pod`` provisions a sandbox backed by committed ``User`` + ``Sandbox``
-    rows (see ``_provisioned_sandbox``), so the owner is read from the sandbox
-    row rather than seeded here. ``live_pod``'s teardown deletes those rows; FK
-    ``ondelete=CASCADE`` drops the related build_session / action_approval /
-    notification rows, so this fixture has nothing to tear down.
+    ``live_pod`` creates the session through the deployed API, so the owner and
+    workspace are already committed exactly as production creates them.
 
     No explicit ``tenant_context`` dependency: ``k8s_manager`` (via
     ``live_pod``) already sets ``CURRENT_TENANT_ID_CONTEXTVAR`` before this body
@@ -278,35 +348,24 @@ def gated_session(
     assert sandbox is not None, "live_pod must back its sandbox with a committed row"
     user = db_session.get(User, sandbox.user_id)
     assert user is not None
+    api_user = _api_user_from_db_user(user)
 
-    # Drop stale BuildSession rows so the seeded row is the single deterministic
-    # one the gate resolves the curl's session tag against.
-    db_session.query(BuildSession).filter(BuildSession.user_id == user.id).delete(
-        synchronize_session=False
-    )
-    db_session.commit()
+    row = db_session.get(BuildSession, session_id)
+    assert row is not None
+    assert row.user_id == user.id
+    assert row.status == BuildSessionStatus.ACTIVE
 
-    row = BuildSession(
-        id=session_id,
-        user_id=user.id,
-        name="approval-gate-test-session",
-        status=BuildSessionStatus.ACTIVE,
-    )
-    db_session.add(row)
-    db_session.commit()
-    db_session.refresh(row)
-
-    yield user, session_id, pod_name
+    yield api_user, session_id, pod_name
 
 
 def test_rejected_decision_returns_403_user_rejected(
     k8s_manager: object,  # noqa: ARG001 — required to construct live_pod
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """REJECTED decision → proxy writes 403 ``user_rejected`` to the sandbox."""
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
 
     output_path = f"/tmp/curl_reject_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -319,14 +378,13 @@ def test_rejected_decision_returns_403_user_rejected(
 
     pending = _wait_for_pending_approval(db_session, session_id)
 
-    response = submit_decision(
-        approval_id=pending.approval_id,
-        body=DecisionBody(decision=ApprovalDecision.REJECTED),
-        user=user,
-        db_session=db_session,
+    response = _submit_decision(
+        api_user,
+        pending.approval_id,
+        ApprovalDecision.REJECTED,
     )
-    assert response.decision == ApprovalDecision.REJECTED
-    assert response.approval_id == pending.approval_id
+    assert response["decision"] == ApprovalDecision.REJECTED.value
+    assert response["approval_id"] == str(pending.approval_id)
 
     status_code, body = wait_for_pod_exec_output(
         k8s_client, pod_name, output_path, timeout_s=30
@@ -340,7 +398,7 @@ def test_rejected_decision_returns_403_user_rejected(
 def test_approved_decision_forwards_to_slack(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """APPROVED → proxy forwards to Slack.
@@ -348,7 +406,7 @@ def test_approved_decision_forwards_to_slack(
     Slack's 200 + ``invalid_auth`` body (the fake bearer can't validate) is the
     proof the request actually reached slack.com.
     """
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
 
     output_path = f"/tmp/curl_approve_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -357,13 +415,12 @@ def test_approved_decision_forwards_to_slack(
 
     pending = _wait_for_pending_approval(db_session, session_id)
 
-    response = submit_decision(
-        approval_id=pending.approval_id,
-        body=DecisionBody(decision=ApprovalDecision.APPROVED),
-        user=user,
-        db_session=db_session,
+    response = _submit_decision(
+        api_user,
+        pending.approval_id,
+        ApprovalDecision.APPROVED,
     )
-    assert response.decision == ApprovalDecision.APPROVED
+    assert response["decision"] == ApprovalDecision.APPROVED.value
 
     status_code, body = wait_for_pod_exec_output(
         k8s_client, pod_name, output_path, timeout_s=45
@@ -382,7 +439,7 @@ def test_approved_decision_forwards_to_slack(
 def test_expired_on_wait_timeout(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """No decision → proxy claims EXPIRED after ``WAIT_TIMEOUT_S``.
@@ -390,7 +447,7 @@ def test_expired_on_wait_timeout(
     curl's --max-time must outlive the spec window so we see the proxy's 403
     rather than the client tearing down first.
     """
-    user, session_id, pod_name = gated_session
+    _api_user, session_id, pod_name = gated_session
 
     output_path = f"/tmp/curl_expire_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -426,7 +483,7 @@ def test_wait_timeout_constant_matches_spec() -> None:
 def test_sigterm_drain_unblocks_parked_request(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """Deleting the parked proxy pod must drain → wake → EXPIRED.
@@ -481,23 +538,12 @@ def test_sigterm_drain_unblocks_parked_request(
 def test_non_gated_egress_works_without_active_session(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
-    """Non-matching egress (npm registry) flows through untagged.
-
-    Session resolution only runs after the matcher fires, so non-gated traffic
-    needs no session tag.
-    """
-    user, _, pod_name = gated_session
-
-    # IDLE to confirm session liveness plays no part in non-gated egress.
-    db_session.execute(
-        update(BuildSession)
-        .where(BuildSession.user_id == user.id)
-        .values(status=BuildSessionStatus.IDLE)
-    )
-    db_session.commit()
+    """Non-matching egress (npm registry) flows through untagged."""
+    api_user, _, pod_name = gated_session
+    user_id = UUID(api_user.id)
 
     output_path = f"/tmp/curl_npm_{uuid4().hex[:8]}"
     pod_exec_async(
@@ -518,7 +564,7 @@ def test_non_gated_egress_works_without_active_session(
         f"active session, got {status_code}"
     )
 
-    assert _approval_count_for_user(db_session, user.id) == 0, (
+    assert _approval_count_for_user(db_session, user_id) == 0, (
         "Non-gated egress must not mint an approval row (under ANY session id)"
     )
 
@@ -526,7 +572,7 @@ def test_non_gated_egress_works_without_active_session(
 def test_gated_egress_without_session_tag_fails_closed(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """Gated request with no session tag → 403 ``no_active_session``, no row.
@@ -534,7 +580,8 @@ def test_gated_egress_without_session_tag_fails_closed(
     Resolution is tag-based only (no most-recent-active fallback), so it fails
     closed even though an ACTIVE session exists for the user.
     """
-    user, _, pod_name = gated_session
+    api_user, _, pod_name = gated_session
+    user_id = UUID(api_user.id)
 
     output_path = f"/tmp/curl_nosession_{uuid4().hex[:8]}"
     _post_slack_via_curl(k8s_client, pod_name, output_path, text="no session")
@@ -548,7 +595,7 @@ def test_gated_egress_without_session_tag_fails_closed(
     )
     _assert_403_error_code(body, "no_active_session")
 
-    assert _approval_count_for_user(db_session, user.id) == 0, (
+    assert _approval_count_for_user(db_session, user_id) == 0, (
         "fail-closed before commit must not mint an approval row"
     )
 
@@ -556,7 +603,8 @@ def test_gated_egress_without_session_tag_fails_closed(
 def test_ask_with_uninvokable_app_forwards_bare(
     k8s_manager: object,  # noqa: ARG001 -- required to construct live_pod
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    k8s_admin_user: DATestUser,
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """ASKs on an app whose auth template can't be filled forwards bare.
@@ -565,14 +613,15 @@ def test_ask_with_uninvokable_app_forwards_bare(
     inject after approval, the gate skips the ASK prompt and forwards the
     request as-is rather than parking it.
     """
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
+    user_id = UUID(api_user.id)
 
     # Strip the org credential the module seed put on Slack so app_is_available
     # falls to False. _isolate_skill_tables restores the row after this test.
-    slack = get_built_in_external_app(db_session, ExternalAppType.SLACK)
-    assert slack is not None, "Module seed must have created the Slack row."
-    slack.organization_credentials = {}  # ty: ignore[invalid-assignment]
-    db_session.commit()
+    _upsert_slack_external_app(
+        k8s_admin_user,
+        organization_credentials={},
+    )
 
     output_path = f"/tmp/curl_bare_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -597,7 +646,7 @@ def test_ask_with_uninvokable_app_forwards_bare(
         f"Bare-forwarded request should reach slack.com and get invalid_auth, "
         f"got body {body!r}"
     )
-    assert _approval_count_for_user(db_session, user.id) == 0, (
+    assert _approval_count_for_user(db_session, user_id) == 0, (
         "Uninvokable ASK must not mint an approval row."
     )
 
@@ -605,7 +654,7 @@ def test_ask_with_uninvokable_app_forwards_bare(
 def test_sse_merger_emits_approval_requested_packet(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """The proxy actually RPUSHes the announce onto real Redis.
@@ -613,7 +662,7 @@ def test_sse_merger_emits_approval_requested_packet(
     Not the full SSE path (that needs a real LLM); the merger pipeline is
     covered by ``backend/tests/unit/build/test_session_manager_merger.py``.
     """
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
 
     output_path = f"/tmp/curl_announce_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -622,7 +671,7 @@ def test_sse_merger_emits_approval_requested_packet(
 
     pending = _wait_for_pending_approval(db_session, session_id)
 
-    cache = get_cache_backend(tenant_id=TEST_TENANT_ID)
+    cache = get_cache_backend(tenant_id=POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE)
     popped = approval_cache.pop_announcement(session_id, timeout_s=5, cache=cache)
     assert popped == pending.approval_id, (
         f"announce list should contain the parked approval id "
@@ -630,11 +679,10 @@ def test_sse_merger_emits_approval_requested_packet(
     )
 
     # Unblock the parked curl so fixture teardown doesn't have to wake the gate.
-    submit_decision(
-        approval_id=pending.approval_id,
-        body=DecisionBody(decision=ApprovalDecision.REJECTED),
-        user=user,
-        db_session=db_session,
+    _submit_decision(
+        api_user,
+        pending.approval_id,
+        ApprovalDecision.REJECTED,
     )
     wait_for_pod_exec_output(k8s_client, pod_name, output_path, timeout_s=30)
 
@@ -642,14 +690,15 @@ def test_sse_merger_emits_approval_requested_packet(
 def test_body_too_large_returns_403(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """Body exceeding ``PARSER_MAX_BODY_BYTES`` (1 MiB) is rejected pre-match.
 
     The gate rejects before the matcher runs, so no approval row is minted.
     """
-    user, _, pod_name = gated_session
+    api_user, _, pod_name = gated_session
+    user_id = UUID(api_user.id)
 
     output_path = f"/tmp/curl_oversize_{uuid4().hex[:8]}"
     body_path = f"/tmp/body_oversize_{uuid4().hex[:8]}.json"
@@ -688,7 +737,7 @@ def test_body_too_large_returns_403(
     )
     _assert_403_error_code(body, "body_too_large")
 
-    assert _approval_count_for_user(db_session, user.id) == 0, (
+    assert _approval_count_for_user(db_session, user_id) == 0, (
         "fail-closed on oversize must not mint an approval row"
     )
 
@@ -696,11 +745,12 @@ def test_body_too_large_returns_403(
 def test_approval_requested_notification_is_created(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """The gate commits its best-effort ``APPROVAL_REQUESTED`` notification."""
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
+    user_id = UUID(api_user.id)
 
     output_path = f"/tmp/curl_notify_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -719,7 +769,7 @@ def test_approval_requested_notification_is_created(
         # (same user) doesn't shadow this run's row.
         notif = (
             db_session.query(Notification)
-            .filter(Notification.user_id == user.id)
+            .filter(Notification.user_id == user_id)
             .filter(Notification.notif_type == NotificationType.APPROVAL_REQUESTED)
             .filter(Notification.dismissed.is_(False))
             .order_by(Notification.first_shown.desc())
@@ -731,7 +781,7 @@ def test_approval_requested_notification_is_created(
         time.sleep(0.5)
 
     assert notif is not None, (
-        f"Expected APPROVAL_REQUESTED notification for user {user.id}, got none."
+        f"Expected APPROVAL_REQUESTED notification for user {user_id}, got none."
     )
     assert notif.additional_data is not None
     assert notif.additional_data.get("approval_id") == str(pending.approval_id), (
@@ -746,181 +796,19 @@ def test_approval_requested_notification_is_created(
     )
 
     # Unblock the parked curl before fixture teardown.
-    submit_decision(
-        approval_id=pending.approval_id,
-        body=DecisionBody(decision=ApprovalDecision.REJECTED),
-        user=user,
-        db_session=db_session,
+    _submit_decision(
+        api_user,
+        pending.approval_id,
+        ApprovalDecision.REJECTED,
     )
     wait_for_pod_exec_output(k8s_client, pod_name, output_path, timeout_s=30)
-
-
-def test_list_live_excludes_aged_pending_rows(
-    k8s_manager: object,  # noqa: ARG001
-    k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
-    db_session: Session,
-) -> None:
-    """Pending rows older than ``WAIT_TIMEOUT_S`` are excluded from /live.
-
-    Two boundary rows (5s either side of the cutoff) make an off-by-one in the
-    ``created_after`` filter (``>=`` vs ``>``) fail this test.
-    """
-    user, session_id, pod_name = gated_session
-
-    output_path = f"/tmp/curl_aged_{uuid4().hex[:8]}"
-    _post_slack_via_curl(
-        k8s_client, pod_name, output_path, text="aged out", session_id=session_id
-    )
-
-    pending = _wait_for_pending_approval(db_session, session_id)
-
-    # Fresh row is live.
-    fresh = list_live_approvals(session_id=session_id, user=user, db_session=db_session)
-    assert any(item.approval_id == pending.approval_id for item in fresh.items), (
-        f"fresh pending row {pending.approval_id} should be in /live, "
-        f"got: {[i.approval_id for i in fresh.items]}"
-    )
-
-    # One row just inside the cutoff (live), one just outside (expired).
-    now = datetime.now(timezone.utc)
-    just_live_id = uuid4()
-    just_expired_id = uuid4()
-    slack_actions = [
-        action_entry(
-            "slack.messages.write",
-            display_name="Post a message",
-            description="Post a message to a channel or conversation.",
-        )
-    ]
-    db_session.add(
-        ActionApproval(
-            approval_id=just_live_id,
-            session_id=session_id,
-            actions=slack_actions,
-            app_name="Slack",
-            payload={"boundary": "just_live"},
-            created_at=now - timedelta(seconds=_WAIT_TIMEOUT_S_SPEC - 5),
-        )
-    )
-    db_session.add(
-        ActionApproval(
-            approval_id=just_expired_id,
-            session_id=session_id,
-            actions=slack_actions,
-            app_name="Slack",
-            payload={"boundary": "just_expired"},
-            created_at=now - timedelta(seconds=_WAIT_TIMEOUT_S_SPEC + 5),
-        )
-    )
-    db_session.commit()
-    db_session.expire_all()
-
-    boundary = list_live_approvals(
-        session_id=session_id, user=user, db_session=db_session
-    )
-    boundary_ids = {item.approval_id for item in boundary.items}
-    assert just_live_id in boundary_ids, (
-        f"Row created {_WAIT_TIMEOUT_S_SPEC - 5}s ago should be live "
-        f"(cutoff edge), got: {boundary_ids}"
-    )
-    assert just_expired_id not in boundary_ids, (
-        f"Row created {_WAIT_TIMEOUT_S_SPEC + 5}s ago should be excluded "
-        f"(just past cutoff), got: {boundary_ids}"
-    )
-
-    # Backdate well past the cutoff so the parked row drops out of /live.
-    aged_at = datetime.now(timezone.utc) - timedelta(seconds=_WAIT_TIMEOUT_S_SPEC + 60)
-    db_session.execute(
-        text("UPDATE action_approval SET created_at = :ts WHERE approval_id = :aid"),
-        {"ts": aged_at, "aid": pending.approval_id},
-    )
-    db_session.commit()
-    db_session.expire_all()
-
-    aged = list_live_approvals(session_id=session_id, user=user, db_session=db_session)
-    aged_ids = {item.approval_id for item in aged.items}
-    assert pending.approval_id not in aged_ids, (
-        f"aged pending row {pending.approval_id} should be excluded from /live, "
-        f"got: {aged_ids}"
-    )
-    # Boundary expectations still hold on the second fetch.
-    assert just_live_id in aged_ids
-    assert just_expired_id not in aged_ids
-
-    # Unblock the parked curl before teardown.
-    submit_decision(
-        approval_id=pending.approval_id,
-        body=DecisionBody(decision=ApprovalDecision.REJECTED),
-        user=user,
-        db_session=db_session,
-    )
-    wait_for_pod_exec_output(k8s_client, pod_name, output_path, timeout_s=30)
-
-
-@pytest.mark.slow
-def test_row_missing_on_claim_returns_expired(
-    k8s_manager: object,  # noqa: ARG001
-    k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
-    db_session: Session,
-) -> None:
-    """FK cascade dropping the approval row mid-park → gate returns EXPIRED.
-
-    Exercises the row-missing branch of ``_claim_expired_or_read_winner``:
-    deleting the BuildSession cascades the action_approval row away while the
-    proxy is parked, so the post-timeout claim finds nothing to UPDATE. Slow:
-    waits out the full ~180s park window.
-    """
-    user, session_id, pod_name = gated_session
-
-    output_path = f"/tmp/curl_rowmissing_{uuid4().hex[:8]}"
-    _post_slack_via_curl(
-        k8s_client,
-        pod_name,
-        output_path,
-        text="drop me",
-        max_time_s=_WAIT_TIMEOUT_S_SPEC + 60,
-        session_id=session_id,
-    )
-
-    pending = _wait_for_pending_approval(db_session, session_id)
-    approval_id = pending.approval_id
-
-    # Deleting the BuildSession cascades the parked approval row away.
-    db_session.query(BuildSession).filter(BuildSession.id == session_id).delete(
-        synchronize_session=False
-    )
-    db_session.commit()
-
-    status_code, body = wait_for_pod_exec_output(
-        k8s_client, pod_name, output_path, timeout_s=_WAIT_TIMEOUT_S_SPEC + 30
-    )
-    assert status_code == 403, (
-        f"sandbox-side curl after row-missing claim should see 403, "
-        f"got {status_code}: {body!r}"
-    )
-    _assert_403_error_code(body, "not_authorized")
-
-    # Row-missing and wait-timeout both return EXPIRED, so the 403 above can't
-    # distinguish them — assert the row is gone to pin the row-missing branch.
-    db_session.expire_all()
-    assert (
-        db_session.scalar(
-            select(ActionApproval).where(ActionApproval.approval_id == approval_id)
-        )
-        is None
-    ), "FK cascade from build_session should have dropped the action_approval row."
-
-    # User survives: cascade only crossed build_session → action_approval.
-    assert db_session.get(User, user.id) is not None
 
 
 @pytest.mark.slow
 def test_post_decision_after_proxy_claimed_expired_returns_conflict(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],
+    gated_session: tuple[DATestUser, UUID, str],
     db_session: Session,
 ) -> None:
     """``submit_decision`` after the proxy already claimed EXPIRED → CONFLICT.
@@ -929,7 +817,7 @@ def test_post_decision_after_proxy_claimed_expired_returns_conflict(
     decision (EXPIRED) differs from the requested one (REJECTED). Slow: only K8s
     coverage of the real wait-timeout claim race; waits the full ~180s.
     """
-    user, session_id, pod_name = gated_session
+    api_user, session_id, pod_name = gated_session
 
     output_path = f"/tmp/curl_conflict_{uuid4().hex[:8]}"
     _post_slack_via_curl(
@@ -960,22 +848,21 @@ def test_post_decision_after_proxy_claimed_expired_returns_conflict(
         f"Proxy should have claimed EXPIRED, got: {refreshed.decision}"
     )
 
-    with pytest.raises(OnyxError) as exc_info:
-        submit_decision(
-            approval_id=pending.approval_id,
-            body=DecisionBody(decision=ApprovalDecision.REJECTED),
-            user=user,
-            db_session=db_session,
-        )
-    assert exc_info.value.error_code == OnyxErrorCode.CONFLICT, (
-        f"expected CONFLICT, got {exc_info.value.error_code}"
+    response = _submit_decision_response(
+        api_user,
+        pending.approval_id,
+        ApprovalDecision.REJECTED,
+    )
+    assert response.status_code == 409
+    assert response.json()["error_code"] == OnyxErrorCode.CONFLICT.value, (
+        f"expected CONFLICT, got {response.text}"
     )
 
 
 def test_unidentified_sandbox_403_from_non_sandbox_pod(
     k8s_manager: object,  # noqa: ARG001
     k8s_client: client.CoreV1Api,
-    gated_session: tuple[User, UUID, str],  # noqa: ARG001 — for fixture chain
+    gated_session: tuple[DATestUser, UUID, str],  # noqa: ARG001 — for fixture chain
 ) -> None:
     """A pod in the sandbox namespace without the managed-by label is rejected.
 
